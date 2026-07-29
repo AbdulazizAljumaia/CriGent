@@ -12,6 +12,61 @@ switch web search on.
 
 ---
 
+## A quick tour
+
+**1 · Add a model you already have**
+
+Open **Models → Add model…** and pick any `.gguf` file on your machine. CriGent
+writes the Modelfile and imports it into Ollama for you — no terminal, no
+commands to memorise. The page also shows which runtime and model folder are in
+use, so you always know where things are going.
+
+![Adding a model](docs/01-add-model.png)
+
+**2 · Pick a model and start straight away**
+
+Choose from everything installed using the selector in the top bar. You can
+switch models in the middle of a conversation; CriGent tells you when Ollama
+needs a moment to swap the new one into VRAM.
+
+![Selecting a model](docs/02-select-model.png)
+
+**3 · Keep an eye on your hardware**
+
+The GPU page shows load, VRAM, temperature, power and clock speeds as they
+happen, with two-minute history graphs and a list of what else is using the
+card. Useful for spotting when a model is too large for your VRAM and spilling
+into system memory.
+
+![GPU dashboard](docs/03-gpu-dashboard.png)
+
+**4 · Adjust the enrichment prompts — optional**
+
+These are the instructions CriGent adds to your message when Tools, Web or
+Skills are switched on. You can rewrite them to change how the model behaves,
+and reset any one back to its original with a single click.
+
+> **Recommended:** leave these as they are unless you have a specific reason to
+> change them. They are tuned so the model reliably produces the fenced blocks
+> CriGent looks for; edits can stop tools or web search working altogether.
+
+![Enrichment prompts](docs/04-prompts.png)
+
+**5 · Choose where the model runs**
+
+This one makes a real difference to speed. **Auto** lets Ollama decide,
+**GPU (CUDA)** pushes as much as possible onto an NVIDIA card, and **CPU** keeps
+it off the GPU entirely.
+
+If you have a capable GPU — say an RTX 5080 with 16 GB of VRAM — choose
+**GPU (CUDA)**. On CPU the same model will be dramatically slower, so it is
+worth setting this deliberately rather than leaving it to chance. Changing it
+makes Ollama reload the model, so the next reply takes a little longer to start.
+
+![Compute selector](docs/05-compute.png)
+
+---
+
 ## Download
 
 Grab `CriGent.exe` from the [latest release](../../releases/latest) and run it.
