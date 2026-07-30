@@ -854,28 +854,64 @@ class GpuWorker(QThread):
             return {"error": str(exc)}
 
 
+def is_parser_error(detail: str) -> bool:
+    """Ollama runs a grammar parser over a thinking/tool model's output. Some
+    fine-tunes drift from the format their base model declares, and the parse
+    fails with a 500 even though generation itself was fine."""
+    low = (detail or "").lower()
+    return ("peg-native" in low
+            or "does not match the expected" in low
+            or "failed to parse" in low and "format" in low)
+
+
 class ChatWorker(QThread):
     chunk = pyqtSignal(str)
     done = pyqtSignal(float, int)
     failed = pyqtSignal(str)
+    notice = pyqtSignal(str)
 
-    def __init__(self, messages, model: str, num_gpu=None):
+    def __init__(self, messages, model: str, num_gpu=None, think=None):
         super().__init__()
         self.messages = messages
         self.model = model
         self.num_gpu = num_gpu
+        self.think = think
         self._stop = False
 
     def stop(self):
         self._stop = True
 
     def run(self):
+        outcome, detail = self._attempt(self.think)
+        if outcome == "parser-error" and self.think is not False:
+            # Retrying without thinking skips the parser that just rejected the
+            # output. Only safe because nothing was streamed to the user yet.
+            self.notice.emit(
+                "This model's output did not match the format Ollama expected, "
+                "so the reply was retried with thinking turned off.")
+            outcome, detail = self._attempt(False)
+        if outcome == "error":
+            self.failed.emit(detail)
+        elif outcome == "parser-error":
+            self.failed.emit(
+                "Ollama could not parse this model's output.\n\n"
+                "The model generated a reply, but it did not match the format "
+                "Ollama expects for this architecture — common with merged or "
+                "fine-tuned builds. Retrying without thinking did not help "
+                "either. Try another model, or a different build of this one.\n\n"
+                f"Ollama said: {detail}")
+
+    def _attempt(self, think):
+        """Returns (outcome, detail). Emits chunks/done itself on success."""
         t0 = time.time()
         tokens = 0
+        streamed = False
         try:
             body = {"model": self.model, "messages": self.messages, "stream": True}
             if self.num_gpu is not None:
                 body["options"] = {"num_gpu": self.num_gpu}
+            if think is not None:
+                body["think"] = think
             with requests.post(
                 CHAT_URL, json=body, stream=True, timeout=(10, 7200),
             ) as resp:
@@ -886,9 +922,11 @@ class ChatWorker(QThread):
                         detail = resp.json().get("error") or resp.text[:300]
                     except Exception:                             # noqa: BLE001
                         detail = resp.text[:300] or "no detail given"
-                    self.failed.emit(f"Ollama rejected the request "
+                    detail = str(detail)
+                    if is_parser_error(detail):
+                        return "parser-error", detail
+                    return "error", (f"Ollama rejected the request "
                                      f"({resp.status_code}): {detail}")
-                    return
                 for line in resp.iter_lines():
                     if self._stop:
                         break
@@ -896,19 +934,25 @@ class ChatWorker(QThread):
                         continue
                     data = json.loads(line)
                     if data.get("error"):
-                        self.failed.emit(str(data["error"]))
-                        return
+                        detail = str(data["error"])
+                        # A parse failure mid-stream can only be retried while
+                        # nothing has reached the user; otherwise it would repeat.
+                        if is_parser_error(detail) and not streamed:
+                            return "parser-error", detail
+                        return "error", detail
                     piece = data.get("message", {}).get("content", "")
                     if piece:
                         tokens += 1
+                        streamed = True
                         self.chunk.emit(piece)
                     if data.get("done"):
                         break
             self.done.emit(time.time() - t0, tokens)
+            return "ok", ""
         except requests.exceptions.ConnectionError:
-            self.failed.emit("Cannot reach Ollama on 127.0.0.1:11434.")
+            return "error", "Cannot reach Ollama on 127.0.0.1:11434."
         except Exception as exc:                                  # noqa: BLE001
-            self.failed.emit(str(exc))
+            return "error", str(exc)
 
 
 class CommandWorker(QThread):
@@ -2994,6 +3038,7 @@ class CriGent(QMainWindow):
         self.chat_worker.chunk.connect(self._on_chunk)
         self.chat_worker.done.connect(self._on_done)
         self.chat_worker.failed.connect(self._on_failed)
+        self.chat_worker.notice.connect(self._notice)
         self.chat_worker.start()
         self.flush.start()
 
