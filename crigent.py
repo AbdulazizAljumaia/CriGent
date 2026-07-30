@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 import zipfile
 from collections import deque
@@ -419,6 +420,52 @@ def app_icon() -> QIcon:
     return icon
 
 
+def install_crash_guard() -> Path:
+    """Stop one bad slot from killing the whole app.
+
+    PyQt aborts the process when an exception escapes a slot — no dialog, no
+    traceback, the window just vanishes. Replacing sys.excepthook keeps the app
+    alive and writes the traceback somewhere we can actually read it.
+    """
+    log_path = ROOT / "crash.log"
+
+    def handler(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"\n===== {stamp} =====\n{text}")
+        except OSError:
+            pass
+        app = QApplication.instance()
+        if app is not None:
+            for widget in app.topLevelWidgets():
+                report = getattr(widget, "report_error", None)
+                if callable(report):
+                    try:
+                        report(exc, text)
+                    except Exception:                              # noqa: BLE001
+                        pass
+                    break
+
+    sys.excepthook = handler
+    return log_path
+
+
+def still_running(worker) -> bool:
+    """isRunning() on a QThread whose C++ side is gone raises RuntimeError, and
+    an exception in a slot is fatal in PyQt. Treat a dead wrapper as finished."""
+    if worker is None:
+        return False
+    try:
+        return worker.isRunning()
+    except RuntimeError:
+        return False
+
+
 def mono_family() -> str:
     for name in ("Cascadia Mono", "Consolas", "Courier New"):
         if name in QFontDatabase.families():
@@ -474,14 +521,21 @@ CODE_FENCE_RE = re.compile(r"```(\w*)\n?(.*?)(?:```|$)", re.S)
 
 
 def split_blocks(text: str):
-    """Split markdown into an alternating [prose, (lang, code), prose, ...] list."""
+    """Split markdown into an alternating [prose, (lang, code), prose, ...] list.
+
+    Prose is further split on blank lines. That keeps each block small, so a
+    streaming reply only has to re-render its final paragraph rather than one
+    ever-growing wall of text.
+    """
     parts = CODE_FENCE_RE.split(text)
     blocks = []
     i = 0
     while i < len(parts):
         prose = parts[i]
         if prose.strip():
-            blocks.append(("prose", prose))
+            for para in re.split(r"\n\s*\n", prose):
+                if para.strip():
+                    blocks.append(("prose", para))
         if i + 2 < len(parts):
             lang, code = parts[i + 1], parts[i + 2]
             if code.strip():
@@ -702,6 +756,15 @@ class CodeBlock(QFrame):
     def _autosize(self):
         self.editor.setFixedHeight(fit_height(self.editor, self._font, cap=self.MAX_HEIGHT))
 
+    def set_code(self, code: str):
+        """Update in place while a reply streams, instead of rebuilding the widget."""
+        code = code.rstrip("\n")
+        if code == self._code:
+            return
+        self._code = code
+        self.editor.setPlainText(code)
+        self._autosize()
+
     def _copy(self):
         QApplication.clipboard().setText(self._code)
         self.copy_btn.setText("Copied")
@@ -724,13 +787,20 @@ class GpuWorker(QThread):
     def __init__(self):
         super().__init__()
         self._run = True
+        self._active = False
 
     def stop(self):
         self._run = False
 
+    def set_active(self, active: bool):
+        """Only poll while the GPU page is visible - two nvidia-smi processes a
+        second is real overhead to pay for a tab nobody is looking at."""
+        self._active = active
+
     def run(self):
         while self._run:
-            self.sample.emit(self._read())
+            if self._active:
+                self.sample.emit(self._read())
             for _ in range(10):                     # 1s total, but exits promptly
                 if not self._run:
                     return
@@ -952,6 +1022,7 @@ class Bubble(QWidget):
         self.body_layout.setContentsMargins(16, 12, 16, 12)
         self.body_layout.setSpacing(8)
         self._prose_name = "proseUser" if role == "user" else "proseBot"
+        self._rendered = None          # block list currently on screen
 
         self.meta = QLabel()
         self.meta.setObjectName("meta")
@@ -982,6 +1053,7 @@ class Bubble(QWidget):
         self.think_btn.setText(("▾ " if vis else "▸ ") + "reasoning")
 
     def _clear_body(self):
+        self._rendered = None
         while self.body_layout.count():
             item = self.body_layout.takeAt(0)
             w = item.widget()
@@ -1011,19 +1083,63 @@ class Bubble(QWidget):
             self.think_btn.show()
             self.think.setText(_inline(reasoning))
 
-        self._clear_body()
         blocks = split_blocks(answer) if answer else []
         if not blocks:
-            self.body_layout.addWidget(self._prose_label("…"))
+            if self._rendered != []:
+                self._clear_body()
+                self.body_layout.addWidget(self._prose_label("…"))
+                self._rendered = []
             return
         if self.role == "user":
             self._hug(answer, blocks)
-        for block in blocks:
+        self._render(blocks)
+
+    def _render(self, blocks: list):
+        """Only touch what actually changed.
+
+        Rebuilding the whole bubble on every streamed chunk is quadratic: a long
+        reply spent minutes recreating widgets and froze the UI for over a second
+        at a time. While streaming, all blocks but the last are already final, so
+        the common prefix is reused and the trailing one is updated in place.
+        """
+        prev = self._rendered
+        if prev is None:                       # placeholder was showing
+            self._clear_body()
+            prev = []
+
+        same = 0
+        while same < len(prev) and same < len(blocks) and prev[same] == blocks[same]:
+            same += 1
+
+        # The usual streaming case: everything settled except the final block.
+        if (same == len(blocks) - 1 == len(prev) - 1
+                and self.body_layout.count() == len(prev)
+                and prev[same][0] == blocks[same][0]):
+            widget = self.body_layout.itemAt(same).widget()
+            block = blocks[same]
+            if block[0] == "prose" and isinstance(widget, QLabel):
+                widget.setText(_inline(block[1]))
+                self._rendered = list(blocks)
+                return
+            if block[0] == "code" and isinstance(widget, CodeBlock):
+                widget.set_code(block[2])
+                self._rendered = list(blocks)
+                return
+
+        # Otherwise drop the tail that changed and rebuild just that part.
+        while self.body_layout.count() > same:
+            item = self.body_layout.takeAt(self.body_layout.count() - 1)
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+                widget.deleteLater()
+        for block in blocks[same:]:
             if block[0] == "prose":
                 self.body_layout.addWidget(self._prose_label(_inline(block[1])))
             else:
                 _, lang, code = block
                 self.body_layout.addWidget(CodeBlock(code, lang, self.mono))
+        self._rendered = list(blocks)
 
     def set_error(self, text: str):
         self._clear_body()
@@ -1672,7 +1788,7 @@ class SetupDialog(QDialog):
         self.go_btn.setText("Retry")
 
     def closeEvent(self, ev):
-        if self.worker and self.worker.isRunning():
+        if still_running(self.worker):
             self.worker.stop()
             self.worker.wait(3000)
         super().closeEvent(ev)
@@ -1839,6 +1955,7 @@ class CriGent(QMainWindow):
         self.chat_worker = None
         self.bubble = None
         self.buffer = ""
+        self._last_flushed = ""
         self.current_model = ""
         self.tool_round = 0
         self._cmd_worker = None
@@ -1867,6 +1984,11 @@ class CriGent(QMainWindow):
         self.flush = QTimer(self)                    # batch tokens -> smooth repaints
         self.flush.setInterval(40)
         self.flush.timeout.connect(self._flush)
+
+        # Building the first CodeBlock costs ~2s while Qt loads the monospace
+        # font and primes its text layout. Pay that during startup instead of
+        # stalling mid-reply the first time the model writes any code.
+        QTimer.singleShot(0, self._warm_fonts)
 
         self.gpu = GpuWorker()
         self.gpu.sample.connect(self._on_gpu)
@@ -1956,6 +2078,8 @@ class CriGent(QMainWindow):
         col.addWidget(self.stack, 1)
 
     def _on_nav(self, index: int):
+        if hasattr(self, "gpu"):
+            self.gpu.set_active(index == 1)
         # Also drive the button state, so programmatic navigation keeps the
         # highlighted tab in sync with the visible page.
         btn = self.nav_group.button(index)
@@ -2606,7 +2730,7 @@ class CriGent(QMainWindow):
         if not name:
             QMessageBox.warning(self, "Invalid name", "Please use letters, numbers or dashes.")
             return
-        if self._import_worker and self._import_worker.isRunning():
+        if still_running(self._import_worker):
             QMessageBox.information(self, "Import running",
                                     "Another model import is still in progress.")
             return
@@ -2676,7 +2800,32 @@ class CriGent(QMainWindow):
     def _untrack(self, worker: QThread):
         if worker in self._workers:
             self._workers.remove(worker)
+        # deleteLater destroys the C++ object, but any attribute still pointing
+        # at it keeps a dead Python wrapper. Touching that raises RuntimeError,
+        # and an exception inside a slot takes the whole app down — which is
+        # exactly what happened when sending a second message.
+        for attr in ("chat_worker", "_cmd_worker", "_import_worker"):
+            if getattr(self, attr, None) is worker:
+                setattr(self, attr, None)
         worker.deleteLater()
+
+    def report_error(self, exc: BaseException, detail: str):
+        """Called by the crash guard so a caught fault is visible, not silent."""
+        try:
+            self._notice(f"Something went wrong internally — "
+                         f"{type(exc).__name__}: {exc}. CriGent is still running; "
+                         f"details were written to {ROOT / 'crash.log'}")
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def _warm_fonts(self):
+        """Force Qt to load the mono font and lay out a code block once, offscreen."""
+        try:
+            primer = CodeBlock("warm = True", "python", self.mono)
+            primer.editor.document().documentLayout().documentSize()
+            primer.deleteLater()
+        except Exception:                                          # noqa: BLE001
+            pass          # purely an optimisation; never let it break startup
 
     def _notice(self, text: str):
         """Inline, centred message in the transcript — used for state the user
@@ -2698,7 +2847,7 @@ class CriGent(QMainWindow):
             self.scroll.verticalScrollBar().maximum()))
 
     def _send_or_stop(self):
-        if self.chat_worker and self.chat_worker.isRunning():
+        if still_running(self.chat_worker):
             self.chat_worker.stop()
             return
         text = self.input.toPlainText().strip()
@@ -2729,6 +2878,7 @@ class CriGent(QMainWindow):
         self.bubble = self._add_bubble("assistant", badge)
         self.bubble.set_text("")
         self.buffer = ""
+        self._last_flushed = ""
         self._scroll_down()
 
         self.send_btn.setText("Stop")
@@ -2755,7 +2905,7 @@ class CriGent(QMainWindow):
             payload = [{"role": "system", "content": "\n\n".join(sys_parts)}] + payload
 
         prev = self.chat_worker
-        if prev is not None and prev.isRunning():
+        if still_running(prev):
             prev.stop()
             prev.wait(2000)
 
@@ -2773,6 +2923,9 @@ class CriGent(QMainWindow):
     def _flush(self):
         if not self.bubble:
             return
+        if self.buffer == self._last_flushed:
+            return                     # nothing new since the last tick
+        self._last_flushed = self.buffer
         stick = self._at_bottom()
         self.bubble.set_text(self.buffer)
         if stick:
@@ -2941,7 +3094,7 @@ class CriGent(QMainWindow):
 
     # -- chat history ------------------------------------------------------ #
     def _new_chat(self):
-        if self.chat_worker and self.chat_worker.isRunning():
+        if still_running(self.chat_worker):
             self.chat_worker.stop()
         while self.feed.count() > 2:                 # keep hint + stretch
             item = self.feed.takeAt(1)
@@ -2963,6 +3116,7 @@ class CriGent(QMainWindow):
         if not self.current_chat_id:
             self.current_chat_id = time.strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
         path = self.chats_dir / f"{self.current_chat_id}.json"
+        is_new = not path.exists()
         created = time.time()
         existing_title = ""
         if path.exists():
@@ -2987,7 +3141,8 @@ class CriGent(QMainWindow):
             "created": created, "updated": time.time(), "messages": self.messages,
         }
         _atomic_write_json(path, data)
-        self._reload_chat_list()
+        if is_new:
+            self._reload_chat_list()      # a row appeared; otherwise nothing moved
 
     def _reload_chat_list(self):
         self.chat_list.clear()
@@ -3025,7 +3180,7 @@ class CriGent(QMainWindow):
         except Exception:                                          # noqa: BLE001
             return
 
-        if self.chat_worker and self.chat_worker.isRunning():
+        if still_running(self.chat_worker):
             self.chat_worker.stop()
         while self.feed.count() > 2:
             item = self.feed.takeAt(1)
@@ -3351,10 +3506,10 @@ class CriGent(QMainWindow):
 
     # -- shutdown --------------------------------------------------------- #
     def closeEvent(self, ev):
-        if self.chat_worker and self.chat_worker.isRunning():
+        if still_running(self.chat_worker):
             self.chat_worker.stop()
         for worker in list(self._workers):
-            if worker.isRunning():
+            if still_running(worker):
                 stop = getattr(worker, "stop", None)
                 if stop:
                     stop()
@@ -3626,6 +3781,7 @@ class CriGent(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    install_crash_guard()
     app.setApplicationName(APP_NAME)
     app.setWindowIcon(app_icon())
     app.setFont(QFont("Segoe UI", 10))
