@@ -809,7 +809,16 @@ class ChatWorker(QThread):
             with requests.post(
                 CHAT_URL, json=body, stream=True, timeout=(10, 7200),
             ) as resp:
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    # Ollama explains itself in the body; raise_for_status throws
+                    # that away and leaves the user staring at a bare status code.
+                    try:
+                        detail = resp.json().get("error") or resp.text[:300]
+                    except Exception:                             # noqa: BLE001
+                        detail = resp.text[:300] or "no detail given"
+                    self.failed.emit(f"Ollama rejected the request "
+                                     f"({resp.status_code}): {detail}")
+                    return
                 for line in resp.iter_lines():
                     if self._stop:
                         break
@@ -2669,6 +2678,17 @@ class CriGent(QMainWindow):
             self._workers.remove(worker)
         worker.deleteLater()
 
+    def _notice(self, text: str):
+        """Inline, centred message in the transcript — used for state the user
+        needs to act on, rather than a modal."""
+        self.hint.hide()
+        label = QLabel(text)
+        label.setObjectName("hint")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        self.feed.insertWidget(self.feed.count() - 1, label)
+        self._scroll_down()
+
     def _at_bottom(self) -> bool:
         sb = self.scroll.verticalScrollBar()
         return sb.value() >= sb.maximum() - 120
@@ -2683,6 +2703,16 @@ class CriGent(QMainWindow):
             return
         text = self.input.toPlainText().strip()
         if not text:
+            return
+
+        # Without this the request goes out as {"model": ""} and Ollama answers
+        # 400 "model is required" — technically accurate, useless to a newcomer
+        # who simply has not imported a model yet.
+        if not self.current_model:
+            self._notice(
+                "No model is selected yet. Open the Models page, choose "
+                "“Add model…” and pick a .gguf file — CriGent imports it for you. "
+                "It will then appear in the selector at the top.")
             return
 
         self.hint.hide()
@@ -3232,9 +3262,20 @@ class CriGent(QMainWindow):
         try:
             names = [m["name"].split(":")[0]
                     for m in requests.get(TAGS_URL, timeout=3).json().get("models", [])]
+            reachable = True
         except Exception:                                        # noqa: BLE001
-            names = []          # server unreachable; leave the picker as it was
+            names, reachable = [], False    # server down; leave the picker alone
+
         if not names:
+            if reachable:
+                # Server is up but has nothing installed: make that state explicit
+                # instead of leaving a stale or empty picker with a model still set.
+                self.model_combo.blockSignals(True)
+                self.model_combo.clear()
+                self.model_combo.addItem("No models installed", userData="")
+                self.model_combo.setCurrentIndex(0)
+                self.model_combo.blockSignals(False)
+                self.current_model = ""
             return
 
         names.sort(key=lambda n: model_label(n)[0].lower())
