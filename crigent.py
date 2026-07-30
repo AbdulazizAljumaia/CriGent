@@ -204,15 +204,40 @@ def model_label(name: str) -> tuple[str, str]:
 # the app shows it to the user and only executes on explicit click.
 TOOL_RE = re.compile(r"```run\s*\n(.*?)```", re.S | re.I)
 MAX_TOOL_ROUNDS = 6
+# Sent whenever any capability is on. Without it, models fall back on their
+# training and answer "I can't browse the web / run commands", refusing work the
+# app is perfectly able to do.
+AGENT_SYSTEM_PROMPT = (
+    "You are running inside CriGent, a desktop application on the user's own Windows "
+    "computer. It gives you real, working abilities, described below.\n\n"
+    "These are not hypothetical and this is not role-play. When you write one of the "
+    "fenced blocks described below, CriGent genuinely performs that action and gives you "
+    "the result in the next message. Set aside any assumption from your training that you "
+    "cannot browse the internet, run commands, or interact with a computer — in this "
+    "application, through these blocks, you can.\n\n"
+    "How to work here:\n"
+    "- Use these abilities whenever they would produce a better answer. Check rather than "
+    "guess; look things up rather than warning that your knowledge may be out of date.\n"
+    "- Never tell the user you are unable to search, run a command, or inspect the system. "
+    "If an ability below covers what is needed, use it instead of declining.\n"
+    "- Do not ask for permission first. Emit the block; the app handles approval.\n"
+    "- Use at most one block per reply, then stop and wait. Never invent, guess or "
+    "pre-write the result — it will be given to you, and you continue from there.\n"
+    "- If none of these abilities are relevant, simply answer normally."
+)
+
 TOOL_SYSTEM_PROMPT = (
-    "You can ask to run a PowerShell command on the user's Windows machine. "
-    "To do so, reply with a fenced code block using the language tag `run`, containing exactly "
-    "one command, e.g.:\n\n```run\nGet-ChildItem C:\\Users\n```\n\n"
-    "The user will review and explicitly approve or deny it before anything executes. You will "
-    "then be told the command's output (or that it was denied) and can continue. Only use a "
-    "`run` block when you actually want that exact command executed right now — use normal "
-    "language-tagged blocks (like ```powershell) for examples you are only showing, not asking "
-    "to run. Put just one command per `run` block; issue another turn for the next one."
+    "## Running commands\n\n"
+    "You can run PowerShell commands on this machine. To do so, end your reply with a "
+    "fenced block tagged `run` containing exactly one command:\n\n"
+    "```run\nGet-ChildItem C:\\Users\n```\n\n"
+    "Then stop. The user sees that exact command and approves or denies it, and you are "
+    "given its output (or told it was denied) so you can carry on.\n\n"
+    "- One command per block. Ask again on your next turn for the next step.\n"
+    "- Use `run` only for a command you want executed now. To show an example the user is "
+    "not meant to run, use an ordinary ```powershell block instead.\n"
+    "- Prefer reading over changing things, and say plainly what a command will do before "
+    "proposing anything that deletes, overwrites or installs."
 )
 
 # Skill protocol: the model proposes a reusable skill with a ```skill fenced block;
@@ -221,13 +246,16 @@ CHATS_DIR = ROOT / "chats"
 SKILLS_PATH = ROOT / "skills.json"
 SKILL_RE = re.compile(r"```skill\s*\n(.*?)```", re.S | re.I)
 SKILL_SYSTEM_PROMPT = (
-    "If the user explicitly asks you to save, remember, or create a reusable skill (a named "
-    "set of instructions they can reuse later), propose it with a fenced block using the "
-    "language tag `skill`, formatted exactly as:\n\n"
-    "```skill\nname: <short skill name>\n---\n<the actual instructions>\n```\n\n"
-    "The user will review it and click Save before it's added to their skill list. Only propose "
-    "a skill when the user is clearly asking for one to be saved — not for ordinary code "
-    "examples or one-off answers."
+    "## Saving skills\n\n"
+    "The user can keep reusable instructions, called skills, and switch them on for later "
+    "conversations. You can write one for them.\n\n"
+    "When they ask you to save, remember, or create a skill, end your reply with:\n\n"
+    "```skill\nname: <short skill name>\n---\n<the instructions>\n```\n\n"
+    "Then stop. They review it and decide whether to save it.\n\n"
+    "- Write the instructions so they still make sense on their own weeks later, with no "
+    "memory of this conversation.\n"
+    "- Only propose a skill when the user has actually asked for one to be saved — not for "
+    "ordinary answers, explanations or code examples."
 )
 
 
@@ -258,14 +286,20 @@ def _atomic_write_json(path: Path, data) -> None:
 SEARCH_RE = re.compile(r"```search\s*\n(.*?)```", re.S | re.I)
 FETCH_RE = re.compile(r"```fetch\s*\n(.*?)```", re.S | re.I)
 WEB_SYSTEM_PROMPT = (
-    "You can search the web or read a specific page to get information beyond your training "
-    "data. To search, reply with a fenced block tagged `search` containing just the query:\n\n"
+    "## Searching the web\n\n"
+    "You have live web access here. You are not limited to your training data, and you do "
+    "not need to speculate about current information or tell the user your knowledge has a "
+    "cut-off — look it up instead.\n\n"
+    "To search, end your reply with:\n\n"
     "```search\nyour query here\n```\n\n"
-    "To read a specific URL, reply with a fenced block tagged `fetch` containing just that URL:\n\n"
+    "To read a particular page:\n\n"
     "```fetch\nhttps://example.com/page\n```\n\n"
-    "Results come back to you automatically and are shown to the user, so no permission step is "
-    "needed — just use one block per turn and wait for the result before continuing. Prefer "
-    "`search` first to find sources, then `fetch` a promising result for detail."
+    "Then stop and wait. Results are fetched automatically, shown to the user, and given "
+    "back to you — no approval step is involved.\n\n"
+    "- Search first to find sources, then fetch a promising result when you need detail.\n"
+    "- Reach for this whenever the answer depends on current facts, specific documentation, "
+    "version numbers, prices, news, or anything you are not confident about.\n"
+    "- Cite what you found, and say so if the sources disagree or look unreliable."
 )
 
 PROMPTS_PATH = ROOT / "prompts.json"
@@ -289,11 +323,15 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
 # The enrichment prompts the app prepends to a request. Editable in the Prompts
 # page and persisted to prompts.json; these stay the reset-to-default source.
 DEFAULT_PROMPTS = {
+    "agent": AGENT_SYSTEM_PROMPT,
     "tools": TOOL_SYSTEM_PROMPT,
     "web": WEB_SYSTEM_PROMPT,
     "skills": SKILL_SYSTEM_PROMPT,
 }
 PROMPT_META = [
+    ("agent", "Agent", "Sent before the others whenever any toggle is on. Tells the model "
+                       "its abilities here are real, so it stops replying that it cannot "
+                       "browse the web or run commands."),
     ("tools", "Tools", "Sent when the Tools toggle is on. Teaches the model to request a "
                        "command with a ```run block."),
     ("web", "Web", "Sent when the Web toggle is on. Teaches the model to search with a "
@@ -2533,8 +2571,15 @@ class CriGent(QMainWindow):
             body.addWidget(card)
 
         actions = QHBoxLayout()
+        restore_all = QPushButton("Restore all defaults")
+        restore_all.setObjectName("ghost")
+        restore_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        restore_all.setToolTip("Put every prompt back to the wording CriGent ships with.")
+        restore_all.clicked.connect(self._restore_all_prompts)
+        actions.addWidget(restore_all)
         self.prompt_status = QLabel("")
         self.prompt_status.setObjectName("meta")
+        self.prompt_status.setWordWrap(True)
         actions.addWidget(self.prompt_status)
         actions.addStretch()
         save = QPushButton("Save prompts")
@@ -2596,8 +2641,16 @@ class CriGent(QMainWindow):
     def _save_prompts(self):
         for key, box in self.prompt_boxes.items():
             self.prompts[key] = box.toPlainText().strip()
-        _atomic_write_json(PROMPTS_PATH, self.prompts)
-        self.prompt_status.setText("Saved — applies to your next message.")
+        # Store only what the user actually changed. Anything still at the default
+        # is left out, so improved wording in a later version reaches people who
+        # never customised, instead of pinning them to old text forever.
+        customised = {k: v for k, v in self.prompts.items()
+                      if v.strip() != DEFAULT_PROMPTS.get(k, "").strip()}
+        _atomic_write_json(PROMPTS_PATH, customised)
+        kept = len(customised)
+        self.prompt_status.setText(
+            f"Saved — applies to your next message. "
+            f"({kept} customised, {len(DEFAULT_PROMPTS) - kept} following the defaults.)")
         timer = QTimer(self.prompt_status)          # parented: dies with the widget
         timer.setSingleShot(True)
         timer.timeout.connect(lambda: self.prompt_status.setText(""))
@@ -2605,7 +2658,36 @@ class CriGent(QMainWindow):
 
     def _reset_prompt(self, key: str):
         self.prompt_boxes[key].setPlainText(DEFAULT_PROMPTS[key])
-        self.prompt_status.setText(f"{key.title()} reset — not saved yet.")
+        self.prompt_status.setText(
+            f"{key.title()} restored to the default — click “Save prompts” to keep it.")
+
+    def _restore_all_prompts(self):
+        changed = [k for k, box in self.prompt_boxes.items()
+                   if box.toPlainText().strip() != DEFAULT_PROMPTS.get(k, "").strip()]
+        if not changed:
+            self.prompt_status.setText("Every prompt is already at its default.")
+            return
+        reply = QMessageBox.question(
+            self, "Restore all defaults",
+            f"Replace {len(changed)} edited prompt(s) with the originals?\n\n"
+            "Your current wording will be discarded.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._apply_default_prompts()
+
+    def _apply_default_prompts(self):
+        """Put every prompt back to the shipped wording and forget the overrides."""
+        for key, box in self.prompt_boxes.items():
+            box.setPlainText(DEFAULT_PROMPTS[key])
+        self.prompts = dict(DEFAULT_PROMPTS)
+        try:
+            if PROMPTS_PATH.exists():
+                PROMPTS_PATH.unlink()      # nothing customised left to store
+        except OSError:
+            pass
+        self.prompt_status.setText("All prompts restored to the originals and saved.")
 
     # -- about page ------------------------------------------------------- #
     def _about_tab(self) -> QWidget:
@@ -3013,6 +3095,10 @@ class CriGent(QMainWindow):
         # Each enrichment prompt is opt-in via its toggle, and comes from the
         # user-editable store rather than the module constants.
         sys_parts = []
+        if (self.tools_check.isChecked() or self.web_check.isChecked()
+                or self.skills_check.isChecked()):
+            # Goes first: without it, models answer "I can't do that".
+            sys_parts.append(self.prompts.get("agent", ""))
         if self.tools_check.isChecked():
             sys_parts.append(self.prompts.get("tools", ""))
         if self.web_check.isChecked():
