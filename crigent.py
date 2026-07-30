@@ -2095,8 +2095,7 @@ class CriGent(QMainWindow):
         self.messages = []
         self.chat_worker = None
         self.bubble = None
-        self.buffer = ""
-        self._last_flushed = ""
+        self.gens = {}                 # chat_id -> live generation state
         self.current_model = ""
         self.tool_round = 0
         self._cmd_worker = None
@@ -2109,9 +2108,6 @@ class CriGent(QMainWindow):
         self.current_chat_id = None
         # A reply belongs to the chat it was asked in, not to whatever is on
         # screen. These follow the generation so the user can browse away.
-        self.gen_chat_id = None
-        self.gen_messages = None
-        self._busy_chat_id = None
         self.chats_dir = CHATS_DIR
         self.chats_dir.mkdir(exist_ok=True)
         self.skills = self._read_skills_file()
@@ -3018,15 +3014,14 @@ class CriGent(QMainWindow):
         except Exception:                                          # noqa: BLE001
             pass
 
-    def _set_busy_chat(self, chat_id):
-        """Spin the green marker on whichever chat is still generating."""
-        self._busy_chat_id = chat_id
+    def _refresh_busy_chats(self):
+        """Spin the green marker on every chat that is still generating — there
+        can be more than one, since replies run in parallel."""
         for i in range(self.chat_list.count()):
-            item = self.chat_list.item(i)
-            row = self.chat_list.itemWidget(item)
+            row = self.chat_list.itemWidget(self.chat_list.item(i))
             if not isinstance(row, ListRow):
                 continue
-            if chat_id and row.key == chat_id:
+            if row.key in self.gens:
                 row.spinner.start()
             else:
                 row.spinner.stop()
@@ -3073,9 +3068,20 @@ class CriGent(QMainWindow):
         QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(
             self.scroll.verticalScrollBar().maximum()))
 
+    # -- generations -------------------------------------------------------
+    # Keyed by chat id. Each entry is {worker, buffer, messages, flushed}. A
+    # single slot meant starting a reply anywhere cancelled the one already
+    # running, so a chat you had walked away from never got its answer.
+    def _gen(self, chat_id):
+        return self.gens.get(chat_id)
+
+    def _current_gen(self):
+        return self.gens.get(self.current_chat_id)
+
     def _send_or_stop(self):
-        if still_running(self.chat_worker):
-            self.chat_worker.stop()
+        live = self._current_gen()
+        if live and still_running(live["worker"]):
+            live["worker"].stop()
             return
         text = self.input.toPlainText().strip()
         if not text:
@@ -3098,23 +3104,31 @@ class CriGent(QMainWindow):
         self.input.clear()
         self.tool_round = 0
         self._save_current_chat()
-        self.gen_chat_id = self.current_chat_id
-        self.gen_messages = self.messages       # same list object, keeps growing
-        self._start_worker()
+        self.gens[self.current_chat_id] = {
+            "worker": None,
+            "buffer": "",
+            "flushed": "",
+            "messages": self.messages,      # same list object, keeps growing
+        }
+        self._start_worker(self.current_chat_id)
 
-    def _start_worker(self):
-        _, badge = model_label(self.current_model)
-        self.bubble = self._add_bubble("assistant", badge)
-        self.bubble.set_text("")
-        self.buffer = ""
-        self._last_flushed = ""
-        self._scroll_down()
+    def _start_worker(self, chat_id: str):
+        gen = self.gens.get(chat_id)
+        if gen is None:
+            return
+        gen["buffer"] = ""
+        gen["flushed"] = ""
 
-        self.send_btn.setText("Stop")
-        self.send_btn.setObjectName("danger")
-        self.send_btn.setStyleSheet("")
-        self.tokens_lbl.setText("generating…")
-        self._set_busy_chat(self.gen_chat_id)
+        if chat_id == self.current_chat_id:
+            _, badge = model_label(self.current_model)
+            self.bubble = self._add_bubble("assistant", badge)
+            self.bubble.set_text("")
+            self._scroll_down()
+            self.send_btn.setText("Stop")
+            self.send_btn.setObjectName("danger")
+            self.send_btn.setStyleSheet("")
+            self.tokens_lbl.setText("generating…")
+        self._refresh_busy_chats()
 
         # Each enrichment prompt is opt-in via its toggle, and comes from the
         # user-editable store rather than the module constants.
@@ -3134,99 +3148,108 @@ class CriGent(QMainWindow):
             sys_parts.append(active_skills)
         sys_parts = [p for p in sys_parts if p.strip()]
 
-        payload = list(self.messages)
+        payload = list(gen["messages"])
         if sys_parts:
             payload = [{"role": "system", "content": "\n\n".join(sys_parts)}] + payload
 
-        prev = self.chat_worker
-        if still_running(prev):
-            prev.stop()
-            prev.wait(2000)
-
-        self.chat_worker = self._track(
-            ChatWorker(payload, self.current_model, self._num_gpu()))
-        self.chat_worker.chunk.connect(self._on_chunk)
-        self.chat_worker.done.connect(self._on_done)
-        self.chat_worker.failed.connect(self._on_failed)
-        self.chat_worker.notice.connect(self._notice)
-        self.chat_worker.start()
+        # Deliberately does not touch other chats' workers. Replies run in
+        # parallel, one per conversation.
+        worker = self._track(ChatWorker(payload, self.current_model, self._num_gpu()))
+        gen["worker"] = worker
+        self.chat_worker = worker            # the most recent, for close-down
+        worker.chunk.connect(lambda t, c=chat_id: self._on_chunk(c, t))
+        worker.done.connect(lambda e, n, c=chat_id: self._on_done(c, e, n))
+        worker.failed.connect(lambda m, c=chat_id: self._on_failed(c, m))
+        worker.notice.connect(self._notice)
+        worker.start()
         self.flush.start()
 
-    def _on_chunk(self, piece: str):
-        self.buffer += piece
+    def _on_chunk(self, chat_id: str, piece: str):
+        gen = self.gens.get(chat_id)
+        if gen is not None:
+            gen["buffer"] += piece
 
     def _flush(self):
-        # No bubble means the user is looking at a different chat; the text is
-        # still accumulating in self.buffer and will be shown when they return.
-        if not self.bubble or self.current_chat_id != self.gen_chat_id:
+        # Only the visible chat is drawn. Other conversations keep accumulating
+        # into their own buffers and are shown when the user goes back to them.
+        gen = self._current_gen()
+        if gen is None or not self.bubble:
             return
-        if self.buffer == self._last_flushed:
+        if gen["buffer"] == gen["flushed"]:
             return                     # nothing new since the last tick
-        self._last_flushed = self.buffer
+        gen["flushed"] = gen["buffer"]
         stick = self._at_bottom()
-        self.bubble.set_text(self.buffer)
+        self.bubble.set_text(gen["buffer"])
         if stick:
             self._scroll_down()
 
-    def _finish_ui(self):
-        self.flush.stop()
-        self._flush()
-        self._set_busy_chat(None)
-        self.send_btn.setText("Send")
-        self.send_btn.setObjectName("primary")
-        self.send_btn.setStyleSheet("")
+    def _finish_ui(self, chat_id: str):
+        if not self.gens:
+            self.flush.stop()
+        if chat_id == self.current_chat_id:
+            self._flush()
+            self.send_btn.setText("Send")
+            self.send_btn.setObjectName("primary")
+            self.send_btn.setStyleSheet("")
+            self.tokens_lbl.setText("")
+        self._refresh_busy_chats()
 
-    def _on_done(self, elapsed: float, tokens: int):
-        self._finish_ui()
-        target = self.gen_messages if self.gen_messages is not None else self.messages
-        if self.buffer:
-            target.append({"role": "assistant", "content": self.buffer})
+    def _on_done(self, chat_id: str, elapsed: float, tokens: int):
+        gen = self.gens.get(chat_id)
+        if gen is None:
+            return
+        text = gen["buffer"]
+        visible = chat_id == self.current_chat_id
+        if visible:
+            self._flush()
+
+        if text:
+            gen["messages"].append({"role": "assistant", "content": text})
         rate = tokens / elapsed if elapsed > 0 else 0
         stamp = f"{elapsed:.1f}s" if elapsed < 60 else f"{elapsed / 60:.1f}m"
-        if self.bubble and self.current_chat_id == self.gen_chat_id:
+        if visible and self.bubble:
             self.bubble.set_meta(f"⏱ {stamp}  ·  {rate:.1f} tok/s")
-        self.tokens_lbl.setText("")
-        self.bubble = None
-        # Write to the chat that asked, which may not be the one on screen.
-        if self.gen_chat_id:
-            self._save_chat(self.gen_chat_id, target)
-        else:
-            self._save_current_chat()
+            self.bubble = None
+        # Always written to the chat that asked, which may not be on screen.
+        self._save_chat(chat_id, gen["messages"])
+        self.gens.pop(chat_id, None)
+        self._finish_ui(chat_id)
 
-        # Only nag about a disabled capability when the model actually refused
-        # and produced no action block of its own.
-        if self.current_chat_id == self.gen_chat_id:
-            self._hint_if_refused(self.buffer)
+        if visible:
+            self._hint_if_refused(text)
 
         if self.tool_round < MAX_TOOL_ROUNDS:
-            tool_match = TOOL_RE.search(self.buffer) if self.tools_check.isChecked() else None
-            search_match = SEARCH_RE.search(self.buffer) if self.web_check.isChecked() else None
-            fetch_match = FETCH_RE.search(self.buffer) if self.web_check.isChecked() else None
+            tool_match = TOOL_RE.search(text) if self.tools_check.isChecked() else None
+            search_match = SEARCH_RE.search(text) if self.web_check.isChecked() else None
+            fetch_match = FETCH_RE.search(text) if self.web_check.isChecked() else None
 
             if tool_match:
                 self.tool_round += 1
-                self._offer_tool(tool_match.group(1).strip())
+                self._offer_tool(chat_id, tool_match.group(1).strip())
             elif search_match:
                 self.tool_round += 1
-                self._start_search(search_match.group(1).strip())
+                self._start_search(chat_id, search_match.group(1).strip())
             elif fetch_match:
                 self.tool_round += 1
-                self._start_fetch(fetch_match.group(1).strip())
+                self._start_fetch(chat_id, fetch_match.group(1).strip())
             elif self.skills_check.isChecked():
-                skill_match = SKILL_RE.search(self.buffer)
+                skill_match = SKILL_RE.search(text)
                 parsed = parse_skill_block(skill_match.group(1)) if skill_match else None
                 if parsed:
                     self.tool_round += 1
-                    self._offer_skill(*parsed)
+                    self._offer_skill(chat_id, *parsed)
 
-    def _on_failed(self, err: str):
-        self._finish_ui()
-        if self.bubble and self.current_chat_id == self.gen_chat_id:
+    def _on_failed(self, chat_id: str, err: str):
+        gen = self.gens.get(chat_id)
+        if chat_id == self.current_chat_id and self.bubble:
             self.bubble.set_error(err)
-        elif self.gen_chat_id and self.gen_chat_id != self.current_chat_id:
-            self._notice_for_chat(self.gen_chat_id, err)
-        self.tokens_lbl.setText("")
-        self.bubble = None
+            self.bubble = None
+        elif gen is not None:
+            self._notice_for_chat(chat_id, err)
+        if gen is not None:
+            self._save_chat(chat_id, gen["messages"])
+        self.gens.pop(chat_id, None)
+        self._finish_ui(chat_id)
         self._save_current_chat()
 
     # "I'm unable to browse the web" and friends. Cheap to detect, and worth
@@ -3264,53 +3287,70 @@ class CriGent(QMainWindow):
         if not checked:
             self.autorun_check.setChecked(False)
 
-    def _offer_tool(self, command: str):
+    def _continue(self, chat_id: str, text: str):
+        """Feed a tool/search/skill result back into the chat that asked, and
+        carry on generating there — even if the user has moved elsewhere."""
+        gen = self.gens.get(chat_id)
+        messages = gen["messages"] if gen else (
+            self.messages if chat_id == self.current_chat_id else None)
+        if messages is None:
+            return
+        messages.append({"role": "user", "content": text})
+        if gen is None:
+            self.gens[chat_id] = {"worker": None, "buffer": "",
+                                  "flushed": "", "messages": messages}
+        self._save_chat(chat_id, messages)
+        if chat_id == self.current_chat_id:
+            self._scroll_down()
+        self._start_worker(chat_id)
+
+    def _offer_tool(self, chat_id: str, command: str):
         auto = self.autorun_check.isChecked()
         card = ToolCard(command, self.mono, auto=auto)
         self.feed.insertWidget(self.feed.count() - 1, card)
         self._scroll_down()
         if auto:
-            self._run_tool(card, command)
+            self._run_tool(chat_id, card, command)
         else:
-            card.run_clicked.connect(lambda c=card, cmd=command: self._run_tool(c, cmd))
-            card.deny_clicked.connect(lambda c=card, cmd=command: self._deny_tool(c, cmd))
+            card.run_clicked.connect(
+                lambda c=card, cmd=command, k=chat_id: self._run_tool(k, c, cmd))
+            card.deny_clicked.connect(
+                lambda c=card, cmd=command, k=chat_id: self._deny_tool(k, c, cmd))
 
-    def _run_tool(self, card: ToolCard, command: str):
+    def _run_tool(self, chat_id: str, card: ToolCard, command: str):
         worker = CommandWorker(command)
         worker.result.connect(
-            lambda out, err, code, c=card, cmd=command: self._tool_result(c, cmd, out, err, code))
+            lambda out, err, code, c=card, cmd=command, k=chat_id:
+            self._tool_result(k, c, cmd, out, err, code))
         self._cmd_worker = self._track(worker)
         worker.start()
 
-    def _tool_result(self, card: ToolCard, command: str, stdout: str, stderr: str, code: int):
+    def _tool_result(self, chat_id: str, card: ToolCard, command: str,
+                     stdout: str, stderr: str, code: int):
         card.show_result(stdout, stderr, code)
         summary = f"$ {command}\nexit code: {code}"
         if stdout.strip():
             summary += f"\n\nstdout:\n{stdout[:4000]}"
         if stderr.strip():
             summary += f"\n\nstderr:\n{stderr[:4000]}"
-        self.messages.append({"role": "user", "content": f"[Tool result]\n{summary}"})
-        self._save_current_chat()
-        self._scroll_down()
-        self._start_worker()
+        self._continue(chat_id, f"[Tool result]\n{summary}")
 
-    def _deny_tool(self, card: ToolCard, command: str):
-        self.messages.append(
-            {"role": "user", "content": f"[User denied running this command: {command}]"})
-        self._save_current_chat()
-        self._start_worker()
+    def _deny_tool(self, chat_id: str, card: ToolCard, command: str):
+        self._continue(chat_id, f"[User denied running this command: {command}]")
 
-    def _start_search(self, query: str):
+    def _start_search(self, chat_id: str, query: str):
         card = WebCard("search", query, self.mono)
         self.feed.insertWidget(self.feed.count() - 1, card)
         self._scroll_down()
         worker = SearchWorker(query)
         worker.result.connect(
-            lambda results, err, c=card, q=query: self._search_result(c, q, results, err))
+            lambda results, err, c=card, q=query, k=chat_id:
+            self._search_result(k, c, q, results, err))
         self._cmd_worker = self._track(worker)
         worker.start()
 
-    def _search_result(self, card: WebCard, query: str, results: list, err: str):
+    def _search_result(self, chat_id: str, card: WebCard, query: str,
+                       results: list, err: str):
         if err:
             card.show_result(f"Error: {err}", ok=False)
             summary = f'Search failed for "{query}": {err}'
@@ -3323,58 +3363,55 @@ class CriGent(QMainWindow):
             text = "\n\n".join(lines)
             card.show_result(text)
             summary = f'Search results for "{query}":\n\n{text[:3500]}'
-        self.messages.append({"role": "user", "content": f"[Web search result]\n{summary}"})
-        self._save_current_chat()
-        self._start_worker()
+        self._continue(chat_id, f"[Web search result]\n{summary}")
 
-    def _start_fetch(self, url: str):
+    def _start_fetch(self, chat_id: str, url: str):
         card = WebCard("fetch", url, self.mono)
         self.feed.insertWidget(self.feed.count() - 1, card)
         self._scroll_down()
         worker = FetchWorker(url)
-        worker.result.connect(lambda text, err, c=card, u=url: self._fetch_result(c, u, text, err))
+        worker.result.connect(
+            lambda text, err, c=card, u=url, k=chat_id: self._fetch_result(k, c, u, text, err))
         self._cmd_worker = self._track(worker)
         worker.start()
 
-    def _fetch_result(self, card: WebCard, url: str, text: str, err: str):
+    def _fetch_result(self, chat_id: str, card: WebCard, url: str, text: str, err: str):
         if err:
             card.show_result(f"Error: {err}", ok=False)
             summary = f"Fetching {url} failed: {err}"
         else:
             card.show_result(text)
             summary = f"Content fetched from {url}:\n\n{text[:4000]}"
-        self.messages.append({"role": "user", "content": f"[Web fetch result]\n{summary}"})
-        self._save_current_chat()
-        self._start_worker()
+        self._continue(chat_id, f"[Web fetch result]\n{summary}")
 
-    def _offer_skill(self, name: str, content: str):
+    def _offer_skill(self, chat_id: str, name: str, content: str):
         card = SkillCard(name, content, self.mono)
         card.save_clicked.connect(
-            lambda c=card, n=name, ct=content: self._save_skill_from_card(c, n, ct))
-        card.discard_clicked.connect(lambda c=card, n=name: self._discard_skill_card(c, n))
+            lambda c=card, n=name, ct=content, k=chat_id:
+            self._save_skill_from_card(k, c, n, ct))
+        card.discard_clicked.connect(
+            lambda c=card, n=name, k=chat_id: self._discard_skill_card(k, c, n))
         self.feed.insertWidget(self.feed.count() - 1, card)
         self._scroll_down()
 
-    def _save_skill_from_card(self, card: SkillCard, name: str, content: str):
+    def _save_skill_from_card(self, chat_id: str, card: SkillCard, name: str, content: str):
         self.skills.append({
             "id": uuid.uuid4().hex[:10], "name": name, "content": content,
             "created": time.time(), "updated": time.time(),
         })
         self._save_skills()
         self._reload_skill_list()
-        self.messages.append({"role": "user", "content": f"[Skill saved: {name}]"})
-        self._save_current_chat()
-        self._start_worker()
+        self._continue(chat_id, f"[Skill saved: {name}]")
 
-    def _discard_skill_card(self, card: SkillCard, name: str):
-        self.messages.append(
-            {"role": "user", "content": f"[User discarded proposed skill: {name}]"})
-        self._save_current_chat()
-        self._start_worker()
+    def _discard_skill_card(self, chat_id: str, card: SkillCard, name: str):
+        self._continue(chat_id, f"[User discarded proposed skill: {name}]")
 
     # -- chat history ------------------------------------------------------ #
     def _new_chat(self):
         self.bubble = None          # generation continues in its own chat
+        self.send_btn.setText("Send")
+        self.send_btn.setObjectName("primary")
+        self.send_btn.setStyleSheet("")
         while self.feed.count() > 2:                 # keep hint + stretch
             item = self.feed.takeAt(1)
             if item.widget():
@@ -3451,7 +3488,7 @@ class CriGent(QMainWindow):
             row.delete_requested.connect(self._delete_chat)
             if chat_id == self.current_chat_id:
                 self.chat_list.setCurrentItem(item)
-            if self._busy_chat_id and chat_id == self._busy_chat_id:
+            if chat_id in self.gens:
                 row.spinner.start()
         self.chat_empty.setVisible(self.chat_list.count() == 0)
 
@@ -3508,12 +3545,19 @@ class CriGent(QMainWindow):
 
         # If this chat is the one still generating, re-attach so the rest of the
         # reply keeps streaming into view instead of arriving invisibly.
-        if self.gen_chat_id and self.gen_chat_id == self.current_chat_id                 and still_running(self.chat_worker):
+        self.send_btn.setText("Send")
+        self.send_btn.setObjectName("primary")
+        self.send_btn.setStyleSheet("")
+        gen = self.gens.get(self.current_chat_id)
+        if gen is not None:
             _, badge = model_label(self.current_model)
             self.bubble = self._add_bubble("assistant", badge)
-            self._last_flushed = ""
-            self.bubble.set_text(self.buffer or "…")
+            gen["flushed"] = ""
+            self.bubble.set_text(gen["buffer"] or "…")
             self.hint.hide()
+            self.send_btn.setText("Stop")
+            self.send_btn.setObjectName("danger")
+            self.send_btn.setStyleSheet("")
 
         self._scroll_down()
         self._reload_chat_list()
