@@ -216,14 +216,28 @@ AGENT_SYSTEM_PROMPT = (
     "cannot browse the internet, run commands, or interact with a computer — in this "
     "application, through these blocks, you can.\n\n"
     "How to work here:\n"
-    "- Use these abilities whenever they would produce a better answer. Check rather than "
-    "guess; look things up rather than warning that your knowledge may be out of date.\n"
-    "- Never tell the user you are unable to search, run a command, or inspect the system. "
-    "If an ability below covers what is needed, use it instead of declining.\n"
-    "- Do not ask for permission first. Emit the block; the app handles approval.\n"
+    "- Act, do not offer. Never end your turn by proposing to use an ability and waiting "
+    "for the user to say yes. If you are about to write \"I can search for that if you "
+    "like\", \"let me know and I'll look it up\", or \"if that sounds helpful\", then do it "
+    "instead, in this same reply.\n"
+    "- Never say you are unable to search the web, fetch a page, run a command, or inspect "
+    "this computer. If an ability below covers what is needed, use it. Saying you cannot is "
+    "simply wrong here, and unhelpful.\n"
+    "- You genuinely cannot recall live information such as current prices, stock, product "
+    "listings or URLs from memory — so look them up rather than apologising for not knowing "
+    "them.\n"
+    "- Do not ask permission. The app handles approval where it is needed.\n"
     "- Use at most one block per reply, then stop and wait. Never invent, guess or "
     "pre-write the result — it will be given to you, and you continue from there.\n"
-    "- If none of these abilities are relevant, simply answer normally."
+    "- If none of these abilities are relevant, simply answer normally.\n\n"
+    "Example of what NOT to do:\n"
+    "  \"I'm unable to pull live product pages. I could search for you — just let me know "
+    "which brand you prefer and I'll run the search.\"\n\n"
+    "Do this instead:\n"
+    "  \"Looking that up now.\n"
+    "  ```search\n"
+    "  Kingston Fury 32GB DDR5 4800 laptop memory price\n"
+    "  ```\"\n"
 )
 
 TOOL_SYSTEM_PROMPT = (
@@ -2435,6 +2449,16 @@ class CriGent(QMainWindow):
             "review and click Save before anything is written to your skill list.")
         row.addWidget(self.skills_check)
 
+        # Web and Skills are read-only, so remembering them is safe and stops the
+        # app silently losing its abilities on every launch. Tools and Auto-run
+        # deliberately stay off until asked for: they execute things.
+        self.web_check.setChecked(bool(self.settings.get("web_enabled", False)))
+        self.skills_check.setChecked(bool(self.settings.get("skills_enabled", False)))
+        self.web_check.toggled.connect(
+            lambda on: self._remember_toggle("web_enabled", on))
+        self.skills_check.toggled.connect(
+            lambda on: self._remember_toggle("skills_enabled", on))
+
         row.addStretch()
         self.tokens_lbl = QLabel("")
         self.tokens_lbl.setObjectName("meta")
@@ -3169,6 +3193,11 @@ class CriGent(QMainWindow):
         else:
             self._save_current_chat()
 
+        # Only nag about a disabled capability when the model actually refused
+        # and produced no action block of its own.
+        if self.current_chat_id == self.gen_chat_id:
+            self._hint_if_refused(self.buffer)
+
         if self.tool_round < MAX_TOOL_ROUNDS:
             tool_match = TOOL_RE.search(self.buffer) if self.tools_check.isChecked() else None
             search_match = SEARCH_RE.search(self.buffer) if self.web_check.isChecked() else None
@@ -3199,6 +3228,36 @@ class CriGent(QMainWindow):
         self.tokens_lbl.setText("")
         self.bubble = None
         self._save_current_chat()
+
+    # "I'm unable to browse the web" and friends. Cheap to detect, and worth
+    # detecting: the usual cause is simply that the capability is switched off.
+    REFUSAL_RE = re.compile(
+        r"(can'?t|cannot|unable to|don'?t have|do not have|no ability to|"
+        r"not able to)[^.\n]{0,60}"
+        r"(search|browse|internet|web|online|live|real[- ]time|fetch|url|link)",
+        re.I)
+    CMD_REFUSAL_RE = re.compile(
+        r"(can'?t|cannot|unable to|don'?t have|not able to)[^.\n]{0,60}"
+        r"(run|execute|command|powershell|terminal|shell|your (?:computer|machine|system))",
+        re.I)
+
+    def _hint_if_refused(self, text: str):
+        """If the model said it couldn't do something the app can do, explain why."""
+        if not text:
+            return
+        if self.REFUSAL_RE.search(text) and not self.web_check.isChecked():
+            self._notice("The model said it cannot search or open links — that is because "
+                         "the Web toggle is off, so it genuinely has no web access right "
+                         "now. Switch on “Web” below the message box and ask again.")
+            return
+        if self.CMD_REFUSAL_RE.search(text) and not self.tools_check.isChecked():
+            self._notice("The model said it cannot run commands — the Tools toggle is off, "
+                         "so it has no way to. Switch on “Tools” below the message box and "
+                         "ask again.")
+
+    def _remember_toggle(self, key: str, on: bool):
+        self.settings[key] = bool(on)
+        self._save_settings()
 
     def _on_tools_toggled(self, checked: bool):
         self.autorun_check.setEnabled(checked)
