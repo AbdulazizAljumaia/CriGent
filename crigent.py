@@ -1238,6 +1238,46 @@ class ToolCard(QFrame):
         self.output.show()
 
 
+class Spinner(QWidget):
+    """Small rotating arc, shown on a chat that is still generating."""
+
+    def __init__(self, colour: str, size: int = 14):
+        super().__init__()
+        self.colour = QColor(colour)
+        self.setFixedSize(size, size)
+        self._angle = 0
+        self._timer = QTimer(self)              # parented: dies with the widget
+        self._timer.setInterval(70)
+        self._timer.timeout.connect(self._step)
+        self.hide()
+
+    def start(self):
+        if not self._timer.isActive():
+            self._timer.start()
+        self.show()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def _step(self):
+        self._angle = (self._angle + 30) % 360
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect().adjusted(2, 2, -2, -2)
+        pen = QPen(QColor(C["line_str"]), 2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawArc(rect, 0, 360 * 16)
+        pen.setColor(self.colour)
+        p.setPen(pen)
+        p.drawArc(rect, -self._angle * 16, 100 * 16)
+        p.end()
+
+
 class ListRow(QWidget):
     """A sidebar/list row: title that elides to the available width, plus an ×
     that asks for confirmation before deleting. Background stays transparent so
@@ -1279,6 +1319,11 @@ class ListRow(QWidget):
             self.sub.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             texts.addWidget(self.sub)
         row.addLayout(texts, 1)
+
+        self.spinner = Spinner(C["green"])
+        self.spinner.setToolTip("Still generating — you can browse other chats "
+                                "while this finishes")
+        row.addWidget(self.spinner, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.close_btn = QPushButton("×")      # U+00D7 renders reliably in Segoe UI
         self.close_btn.setObjectName("rowClose")
@@ -1966,6 +2011,11 @@ class CriGent(QMainWindow):
         self._workers = []
 
         self.current_chat_id = None
+        # A reply belongs to the chat it was asked in, not to whatever is on
+        # screen. These follow the generation so the user can browse away.
+        self.gen_chat_id = None
+        self.gen_messages = None
+        self._busy_chat_id = None
         self.chats_dir = CHATS_DIR
         self.chats_dir.mkdir(exist_ok=True)
         self.skills = self._read_skills_file()
@@ -2818,6 +2868,33 @@ class CriGent(QMainWindow):
         except Exception:                                          # noqa: BLE001
             pass
 
+    def _set_busy_chat(self, chat_id):
+        """Spin the green marker on whichever chat is still generating."""
+        self._busy_chat_id = chat_id
+        for i in range(self.chat_list.count()):
+            item = self.chat_list.item(i)
+            row = self.chat_list.itemWidget(item)
+            if not isinstance(row, ListRow):
+                continue
+            if chat_id and row.key == chat_id:
+                row.spinner.start()
+            else:
+                row.spinner.stop()
+
+    def _notice_for_chat(self, chat_id: str, err: str):
+        """A reply failed in a chat the user is not looking at — record it there
+        so the message is not lost, and say so if they are nearby."""
+        path = self.chats_dir / f"{chat_id}.json"
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data.setdefault("messages", []).append(
+                {"role": "assistant", "content": f"⚠ {err}"})
+            _atomic_write_json(path, data)
+        except Exception:                                          # noqa: BLE001
+            pass
+
     def _warm_fonts(self):
         """Force Qt to load the mono font and lay out a code block once, offscreen."""
         try:
@@ -2871,6 +2948,8 @@ class CriGent(QMainWindow):
         self.input.clear()
         self.tool_round = 0
         self._save_current_chat()
+        self.gen_chat_id = self.current_chat_id
+        self.gen_messages = self.messages       # same list object, keeps growing
         self._start_worker()
 
     def _start_worker(self):
@@ -2885,6 +2964,7 @@ class CriGent(QMainWindow):
         self.send_btn.setObjectName("danger")
         self.send_btn.setStyleSheet("")
         self.tokens_lbl.setText("generating…")
+        self._set_busy_chat(self.gen_chat_id)
 
         # Each enrichment prompt is opt-in via its toggle, and comes from the
         # user-editable store rather than the module constants.
@@ -2921,7 +3001,9 @@ class CriGent(QMainWindow):
         self.buffer += piece
 
     def _flush(self):
-        if not self.bubble:
+        # No bubble means the user is looking at a different chat; the text is
+        # still accumulating in self.buffer and will be shown when they return.
+        if not self.bubble or self.current_chat_id != self.gen_chat_id:
             return
         if self.buffer == self._last_flushed:
             return                     # nothing new since the last tick
@@ -2934,21 +3016,27 @@ class CriGent(QMainWindow):
     def _finish_ui(self):
         self.flush.stop()
         self._flush()
+        self._set_busy_chat(None)
         self.send_btn.setText("Send")
         self.send_btn.setObjectName("primary")
         self.send_btn.setStyleSheet("")
 
     def _on_done(self, elapsed: float, tokens: int):
         self._finish_ui()
+        target = self.gen_messages if self.gen_messages is not None else self.messages
         if self.buffer:
-            self.messages.append({"role": "assistant", "content": self.buffer})
+            target.append({"role": "assistant", "content": self.buffer})
         rate = tokens / elapsed if elapsed > 0 else 0
         stamp = f"{elapsed:.1f}s" if elapsed < 60 else f"{elapsed / 60:.1f}m"
-        if self.bubble:
+        if self.bubble and self.current_chat_id == self.gen_chat_id:
             self.bubble.set_meta(f"⏱ {stamp}  ·  {rate:.1f} tok/s")
         self.tokens_lbl.setText("")
         self.bubble = None
-        self._save_current_chat()
+        # Write to the chat that asked, which may not be the one on screen.
+        if self.gen_chat_id:
+            self._save_chat(self.gen_chat_id, target)
+        else:
+            self._save_current_chat()
 
         if self.tool_round < MAX_TOOL_ROUNDS:
             tool_match = TOOL_RE.search(self.buffer) if self.tools_check.isChecked() else None
@@ -2973,8 +3061,10 @@ class CriGent(QMainWindow):
 
     def _on_failed(self, err: str):
         self._finish_ui()
-        if self.bubble:
+        if self.bubble and self.current_chat_id == self.gen_chat_id:
             self.bubble.set_error(err)
+        elif self.gen_chat_id and self.gen_chat_id != self.current_chat_id:
+            self._notice_for_chat(self.gen_chat_id, err)
         self.tokens_lbl.setText("")
         self.bubble = None
         self._save_current_chat()
@@ -3094,14 +3184,14 @@ class CriGent(QMainWindow):
 
     # -- chat history ------------------------------------------------------ #
     def _new_chat(self):
-        if still_running(self.chat_worker):
-            self.chat_worker.stop()
+        self.bubble = None          # generation continues in its own chat
         while self.feed.count() > 2:                 # keep hint + stretch
             item = self.feed.takeAt(1)
             if item.widget():
                 item.widget().deleteLater()
-        self.messages.clear()
-        self.buffer = ""
+        # Rebind rather than clear(): a running reply holds this exact list as
+        # gen_messages, and emptying it would delete the question it answers.
+        self.messages = []
         self.bubble = None
         self.tool_round = 0
         self.current_chat_id = None
@@ -3115,7 +3205,14 @@ class CriGent(QMainWindow):
             return
         if not self.current_chat_id:
             self.current_chat_id = time.strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
-        path = self.chats_dir / f"{self.current_chat_id}.json"
+        self._save_chat(self.current_chat_id, self.messages)
+
+    def _save_chat(self, chat_id: str, messages: list):
+        """Persist any chat by id — the one on screen may not be the one that
+        just finished generating."""
+        if not messages:
+            return
+        path = self.chats_dir / f"{chat_id}.json"
         is_new = not path.exists()
         created = time.time()
         existing_title = ""
@@ -3131,14 +3228,14 @@ class CriGent(QMainWindow):
         if existing_title:
             title = existing_title
         else:
-            first_user = next((m["content"] for m in self.messages if m["role"] == "user"),
+            first_user = next((m["content"] for m in messages if m["role"] == "user"),
                               "New chat")
             squashed = " ".join(first_user.split())
             # Stored long; the sidebar elides it to fit, so nothing is lost here.
             title = squashed[:120] or "New chat"
         data = {
-            "id": self.current_chat_id, "title": title, "model": self.current_model,
-            "created": created, "updated": time.time(), "messages": self.messages,
+            "id": chat_id, "title": title, "model": self.current_model,
+            "created": created, "updated": time.time(), "messages": messages,
         }
         _atomic_write_json(path, data)
         if is_new:
@@ -3164,6 +3261,8 @@ class CriGent(QMainWindow):
             row.delete_requested.connect(self._delete_chat)
             if chat_id == self.current_chat_id:
                 self.chat_list.setCurrentItem(item)
+            if self._busy_chat_id and chat_id == self._busy_chat_id:
+                row.spinner.start()
         self.chat_empty.setVisible(self.chat_list.count() == 0)
 
     def _on_chat_item_clicked(self, item: QListWidgetItem):
@@ -3180,8 +3279,9 @@ class CriGent(QMainWindow):
         except Exception:                                          # noqa: BLE001
             return
 
-        if still_running(self.chat_worker):
-            self.chat_worker.stop()
+        # Deliberately does NOT stop the worker: a reply keeps running in the
+        # chat it belongs to while the user reads or writes somewhere else.
+        self.bubble = None
         while self.feed.count() > 2:
             item = self.feed.takeAt(1)
             if item.widget():
@@ -3189,7 +3289,8 @@ class CriGent(QMainWindow):
 
         self.messages = data.get("messages", [])
         self.current_chat_id = data.get("id", chat_id)
-        self.buffer = ""
+        # self.buffer is owned by the in-flight reply; clearing it here would
+        # throw away text that has already streamed in for another chat.
         self.bubble = None
         self.tool_round = 0
         self.tools_check.setChecked(False)      # don't silently resume tool/auto-run for a
@@ -3214,6 +3315,15 @@ class CriGent(QMainWindow):
                 b.set_text(m.get("content", ""))
         else:
             self.hint.show()
+
+        # If this chat is the one still generating, re-attach so the rest of the
+        # reply keeps streaming into view instead of arriving invisibly.
+        if self.gen_chat_id and self.gen_chat_id == self.current_chat_id                 and still_running(self.chat_worker):
+            _, badge = model_label(self.current_model)
+            self.bubble = self._add_bubble("assistant", badge)
+            self._last_flushed = ""
+            self.bubble.set_text(self.buffer or "…")
+            self.hint.hide()
 
         self._scroll_down()
         self._reload_chat_list()
