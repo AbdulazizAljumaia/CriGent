@@ -30,6 +30,8 @@ skills.json
 prompts.json
 settings.json
 location.json
+usage.json
+crashes.json
 
 # Logs and scratch
 *.log
