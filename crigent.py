@@ -14,6 +14,7 @@ import traceback
 import uuid
 import zipfile
 from collections import deque
+from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -127,6 +128,7 @@ ROOT = _app_dir()
 def set_data_dir(path: Path) -> None:
     """Move CriGent's storage somewhere else and rebind every derived path."""
     global ROOT, CHATS_DIR, SKILLS_PATH, PROMPTS_PATH, SETTINGS_PATH, MODELS_DIR
+    global USAGE_PATH
     path.mkdir(parents=True, exist_ok=True)
     LOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
     LOCATION_FILE.write_text(json.dumps({"data_dir": str(path)}, indent=2),
@@ -136,6 +138,7 @@ def set_data_dir(path: Path) -> None:
     SKILLS_PATH = ROOT / "skills.json"
     PROMPTS_PATH = ROOT / "prompts.json"
     SETTINGS_PATH = ROOT / "settings.json"
+    USAGE_PATH = ROOT / "usage.json"
     MODELS_DIR = ROOT / "models"
 OLLAMA_DL_URL = ("https://github.com/ollama/ollama/releases/download/"
                  "v0.32.5/ollama-windows-amd64.zip")
@@ -305,11 +308,69 @@ SKILL_SYSTEM_PROMPT = (
     "When they ask you to save, remember, or create a skill, end your reply with:\n\n"
     "```skill\nname: <short skill name>\n---\n<the instructions>\n```\n\n"
     "Then stop. They review it and decide whether to save it.\n\n"
-    "- Write the instructions so they still make sense on their own weeks later, with no "
-    "memory of this conversation.\n"
-    "- Only propose a skill when the user has actually asked for one to be saved — not for "
+    "**If the instructions contain a fenced code block, wrap the whole skill in four "
+    "backticks** (````skill … ````) so the inner fences cannot be mistaken for the end.\n\n"
+    "### Naming\n\n"
+    "- Two to four words, describing the job, not the library: \"Web scraping\", not "
+    "\"requests scraping\".\n"
+    "- Sentence case, no trailing punctuation, no version numbers.\n"
+    "- Check the spelling before you write it — the name is what the user picks from a "
+    "list later, and a typo there is permanent until they rename it.\n\n"
+    "### Writing the instructions\n\n"
+    "- Address the assistant that will read it, in the second person: \"You write Python "
+    "scrapers…\". It is a standing instruction, not a description of one.\n"
+    "- Open with one line saying **when it applies**, so it is obvious whether to follow "
+    "it for a given question.\n"
+    "- Then the rules themselves: short `##` headings, and bullets or numbered steps under "
+    "each. Concrete and testable — \"time out after 10s\" beats \"handle errors well\".\n"
+    "- Include a worked template only if the user would otherwise retype it every time; "
+    "put it in a fenced block with the language named, and keep it minimal.\n"
+    "- Say what to avoid as well as what to do, where a mistake is likely.\n"
+    "- Self-contained: it must still make sense weeks later, to someone who never saw this "
+    "conversation. No \"as we discussed\", no references to this chat.\n"
+    "- Aim for 10–40 lines. If it is longer, it is probably two skills.\n\n"
+    "Only propose a skill when the user has actually asked for one to be saved — not for "
     "ordinary answers, explanations or code examples."
 )
+
+
+FENCE_RE = re.compile(r"^(`{3,})[ \t]*([A-Za-z0-9_+.#-]*)[ \t]*$")
+
+
+def extract_block(text: str, tag: str):
+    """Body of a ```<tag> fenced block, or None.
+
+    A non-greedy `(.*?)``` ` regex stops at the first closing fence it meets.
+    For a skill holding a code template that is the template's *own* opening
+    fence, so the skill was silently saved cut off at that point. This walks
+    the lines instead, stepping over nested fences, and also accepts an outer
+    fence of four or more backticks — the standard way to wrap code in code.
+    """
+    lines = text.splitlines()
+    start = ticks = None
+    for i, line in enumerate(lines):
+        m = FENCE_RE.match(line.strip())
+        if m and m.group(2).lower() == tag.lower():
+            ticks, start = len(m.group(1)), i + 1
+            break
+    if start is None:
+        return None
+
+    inner = False                      # inside a nested fence
+    for j in range(start, len(lines)):
+        m = FENCE_RE.match(lines[j].strip())
+        if not m:
+            continue
+        run, lang = len(m.group(1)), m.group(2)
+        if not inner and not lang and run >= ticks:
+            return "\n".join(lines[start:j])
+        if not inner and lang:
+            inner = True               # ```python … opens a nested block
+        elif inner and not lang:
+            inner = False              # …``` closes it
+    # Unclosed: either still streaming, or the model forgot the last fence.
+    # Returning what there is beats discarding the whole block.
+    return "\n".join(lines[start:])
 
 
 def parse_skill_block(raw: str):
@@ -325,6 +386,40 @@ def parse_skill_block(raw: str):
     if not name or not content:
         return None
     return name, content
+
+
+def load_usage() -> dict:
+    """Token history, bucketed by calendar day.
+
+    Per-day totals rather than per-reply records: a year of heavy use is a few
+    hundred small entries, so the file never needs pruning and reading it for
+    the Usage page stays instant.
+    """
+    try:
+        data = json.loads(USAGE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:                                              # noqa: BLE001
+        return {}
+
+
+def usage_totals(usage: dict, days: int | None = None, today: date | None = None):
+    """Sum the buckets covering the last `days` days (None = everything)."""
+    today = today or date.today()
+    out = {"in": 0, "out": 0, "replies": 0, "seconds": 0.0}
+    for key, rec in usage.items():
+        if days is not None:
+            try:
+                day = date.fromisoformat(key)
+            except ValueError:
+                continue
+            if not 0 <= (today - day).days < days:
+                continue
+        out["in"] += rec.get("in", 0)
+        out["out"] += rec.get("out", 0)
+        out["replies"] += rec.get("replies", 0)
+        out["seconds"] += rec.get("seconds", 0.0)
+    out["total"] = out["in"] + out["out"]
+    return out
 
 
 def _atomic_write_json(path: Path, data) -> None:
@@ -357,6 +452,7 @@ WEB_SYSTEM_PROMPT = (
 
 PROMPTS_PATH = ROOT / "prompts.json"
 SETTINGS_PATH = ROOT / "settings.json"
+USAGE_PATH = ROOT / "usage.json"
 MODELS_DIR = ROOT / "models"
 
 # Where the model runs. Ollama takes num_gpu as the count of layers to offload,
@@ -1011,7 +1107,7 @@ def is_parser_error(detail: str) -> bool:
 
 class ChatWorker(QThread):
     chunk = pyqtSignal(str)
-    done = pyqtSignal(float, int)
+    done = pyqtSignal(float, int, int)      # seconds, output tokens, prompt tokens
     failed = pyqtSignal(str)
     notice = pyqtSignal(str)
 
@@ -1063,6 +1159,7 @@ class ChatWorker(QThread):
         streamed = False
         self._streamed = False
         thinking_open = False
+        final = {}
         try:
             body = {"model": self.model, "messages": self.messages, "stream": True}
             if self.num_gpu is not None:
@@ -1121,8 +1218,14 @@ class ChatWorker(QThread):
                     if data.get("done"):
                         if thinking_open:      # a reply that never left thinking
                             self.chunk.emit("</reasoning>")
+                        final = data
                         break
-            self.done.emit(time.time() - t0, tokens)
+            # Ollama reports the true counts on the final chunk. Counting
+            # chunks, as this used to, only approximates the output and says
+            # nothing at all about what the prompt cost.
+            out_tokens = int(final.get("eval_count") or tokens)
+            in_tokens = int(final.get("prompt_eval_count") or 0)
+            self.done.emit(time.time() - t0, out_tokens, in_tokens)
             return "ok", ""
         except requests.exceptions.Timeout:
             mins = self.STALL_S // 60
@@ -1766,6 +1869,71 @@ class BusyStrip(QFrame):
     def stop(self):
         self.spinner.stop()
         self.hide()
+
+
+class UsageBars(QWidget):
+    """Tokens per day for the last N days. Painted rather than composed from
+    widgets: one bar per day is a lot of widgets to lay out for a static chart."""
+
+    def __init__(self, days: int = 30):
+        super().__init__()
+        self.days = days
+        self.values = []                   # oldest → newest
+        self.labels = []
+        self.setMinimumHeight(150)
+
+    def set_data(self, usage: dict, today: date | None = None):
+        today = today or date.today()
+        self.values, self.labels = [], []
+        for i in range(self.days - 1, -1, -1):
+            day = today - timedelta(days=i)
+            rec = usage.get(day.isoformat(), {})
+            self.values.append(rec.get("in", 0) + rec.get("out", 0))
+            self.labels.append(day)
+        self.update()
+
+    def paintEvent(self, _):
+        if not self.values:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        band = 18                                   # room for the date labels
+        top, bottom = 4, self.height() - band
+        usable = max(1, bottom - top)
+        peak = max(self.values) or 1
+        gap = 3
+        slot = self.width() / len(self.values)
+        width = max(2.0, slot - gap)
+
+        p.setPen(QPen(QColor(C["line"]), 1))
+        p.drawLine(0, bottom, self.width(), bottom)
+
+        for i, value in enumerate(self.values):
+            x = i * slot
+            height = 0 if not value else max(2, round(usable * value / peak))
+            colour = QColor(C["accent"]) if value else QColor(C["line"])
+            p.fillRect(QRectF(x, bottom - height, width, height), colour)
+
+        # Only the ends and the middle are labelled — 30 dates never fit. Each
+        # label is kept inside the widget; a rect starting off-canvas simply
+        # does not draw, which silently lost the first and last dates.
+        p.setPen(QColor(C["faint"]))
+        font = p.font()
+        font.setPixelSize(10)
+        p.setFont(font)
+        mid = len(self.values) // 2
+        band_top = bottom + 2
+        places = (
+            (0, QRectF(0, band_top, 70, band), Qt.AlignmentFlag.AlignLeft),
+            (mid, QRectF(mid * slot - 35, band_top, 70, band),
+             Qt.AlignmentFlag.AlignHCenter),
+            (len(self.values) - 1, QRectF(self.width() - 70, band_top, 70, band),
+             Qt.AlignmentFlag.AlignRight),
+        )
+        for idx, rect, align in places:
+            text = self.labels[idx].strftime("%d %b")
+            p.drawText(rect, int(align | Qt.AlignmentFlag.AlignVCenter), text)
+        p.end()
 
 
 class ListRow(QWidget):
@@ -2512,6 +2680,7 @@ class CriGent(QMainWindow):
         self.skills = self._read_skills_file()
         self.prompts = self._read_prompts_file()
         self.settings = self._read_settings()
+        self.usage = load_usage()
         self._import_worker = None
 
         self.setWindowTitle(APP_NAME)
@@ -2521,6 +2690,7 @@ class CriGent(QMainWindow):
         self._build()
         self._reload_chat_list()
         self._reload_skill_list()
+        self._refresh_usage()
 
         self.flush = QTimer(self)                    # batch tokens -> smooth repaints
         self.flush.setInterval(40)
@@ -2567,7 +2737,7 @@ class CriGent(QMainWindow):
         self.nav_group.setExclusive(True)
         nav = QHBoxLayout()
         nav.setSpacing(2)
-        for i, name in enumerate(("Chat", "GPU", "Prompts", "Models", "About")):
+        for i, name in enumerate(("Chat", "GPU", "Usage", "Prompts", "Models", "About")):
             btn = QPushButton(name)
             btn.setObjectName("navBtn")
             btn.setCheckable(True)
@@ -2613,6 +2783,7 @@ class CriGent(QMainWindow):
         self.stack = QStackedWidget()
         self.stack.addWidget(self._chat_tab())
         self.stack.addWidget(self._gpu_tab())
+        self.stack.addWidget(self._usage_tab())
         self.stack.addWidget(self._prompts_tab())
         self.stack.addWidget(self._models_tab())
         self.stack.addWidget(self._about_tab())
@@ -2627,7 +2798,9 @@ class CriGent(QMainWindow):
         if btn and not btn.isChecked():
             btn.setChecked(True)
         self.stack.setCurrentIndex(index)
-        if index == 3:
+        if index == 2:
+            self._refresh_usage()
+        if index == 4:
             self._reload_model_list()
 
     def _chat_tab(self) -> QWidget:
@@ -2961,6 +3134,115 @@ class CriGent(QMainWindow):
         return page, body
 
     # -- prompts page ----------------------------------------------------- #
+    # -- usage page -------------------------------------------------------- #
+    def _record_usage(self, out_tokens: int, in_tokens: int, seconds: float):
+        """Add one reply to today's bucket."""
+        if not (out_tokens or in_tokens):
+            return
+        key = date.today().isoformat()
+        self.usage = load_usage()          # re-read: another window may have written
+        rec = self.usage.setdefault(
+            key, {"in": 0, "out": 0, "replies": 0, "seconds": 0.0, "models": {}})
+        rec["in"] += int(in_tokens)
+        rec["out"] += int(out_tokens)
+        rec["replies"] += 1
+        rec["seconds"] = round(rec.get("seconds", 0.0) + seconds, 1)
+        model = self.current_model or "unknown"
+        rec.setdefault("models", {})
+        rec["models"][model] = rec["models"].get(model, 0) + int(out_tokens) + int(in_tokens)
+        try:
+            _atomic_write_json(USAGE_PATH, self.usage)
+        except Exception:                                          # noqa: BLE001
+            pass                                                   # never break a reply
+        if self.stack.currentIndex() == 2:
+            self._refresh_usage()
+
+    def _usage_tab(self) -> QWidget:
+        page, body = self._page(
+            "Token usage",
+            "How much these models have generated on this machine. Counted from what "
+            "Ollama reports for each reply — prompt tokens are what CriGent sent, "
+            "output tokens what the model wrote back. Nothing leaves this computer.")
+
+        self.usage_cards = {}
+        totals = Card("Totals")
+        grid = QHBoxLayout()
+        grid.setSpacing(10)
+        for key, label in (("today", "Today"), ("week", "Last 7 days"),
+                           ("month", "Last 30 days"), ("all", "All time")):
+            box = QFrame()
+            box.setObjectName("statBox")
+            v = QVBoxLayout(box)
+            v.setContentsMargins(14, 12, 14, 12)
+            v.setSpacing(2)
+            cap = QLabel(label)
+            cap.setObjectName("statCap")
+            value = QLabel("—")
+            value.setObjectName("statValue")
+            sub = QLabel("")
+            sub.setObjectName("statSub")
+            sub.setWordWrap(True)
+            v.addWidget(cap)
+            v.addWidget(value)
+            v.addWidget(sub)
+            grid.addWidget(box, 1)
+            self.usage_cards[key] = (value, sub)
+        totals.box.addLayout(grid)
+        body.addWidget(totals)
+
+        chart = Card("Last 30 days")
+        self.usage_bars = UsageBars(30)
+        chart.box.addWidget(self.usage_bars)
+        body.addWidget(chart)
+
+        self.usage_models_card = Card("By model · last 30 days")
+        self.usage_models = QLabel("—")
+        self.usage_models.setObjectName("pageSub")
+        self.usage_models.setWordWrap(True)
+        self.usage_models_card.box.addWidget(self.usage_models)
+        body.addWidget(self.usage_models_card)
+
+        body.addStretch()
+        return page
+
+    def _refresh_usage(self):
+        self.usage = load_usage()
+        today = date.today()
+        spans = {"today": 1, "week": 7, "month": 30, "all": None}
+        for key, days in spans.items():
+            value, sub = self.usage_cards[key]
+            t = usage_totals(self.usage, days, today)
+            value.setText(f"{t['total']:,}")
+            if t["replies"]:
+                mins = t["seconds"] / 60
+                spent = f"{mins:.0f} min" if mins >= 1 else f"{t['seconds']:.0f}s"
+                value_sub = (f"{t['replies']:,} repl{'y' if t['replies'] == 1 else 'ies'} · "
+                             f"{t['in']:,} in / {t['out']:,} out · {spent} generating")
+            else:
+                value_sub = "nothing yet"
+            sub.setText(value_sub)
+
+        self.usage_bars.set_data(self.usage, today)
+
+        per_model = {}
+        for key, rec in self.usage.items():
+            try:
+                if (today - date.fromisoformat(key)).days >= 30:
+                    continue
+            except ValueError:
+                continue
+            for name, n in (rec.get("models") or {}).items():
+                per_model[name] = per_model.get(name, 0) + n
+        if per_model:
+            ranked = sorted(per_model.items(), key=lambda kv: -kv[1])
+            total = sum(per_model.values()) or 1
+            lines = [f"<b>{_html.escape(model_label(name)[0])}</b> — "
+                     f"{n:,} tokens ({n * 100 // total}%)"
+                     for name, n in ranked]
+            self.usage_models.setText("<br>".join(lines))
+        else:
+            self.usage_models.setText("No replies recorded in the last 30 days.")
+
     def _prompts_tab(self) -> QWidget:
         page, body = self._page(
             "Enrichment prompts",
@@ -3666,7 +3948,8 @@ class CriGent(QMainWindow):
         gen["worker"] = worker
         self.chat_worker = worker            # the most recent, for close-down
         worker.chunk.connect(lambda t, c=chat_id: self._on_chunk(c, t))
-        worker.done.connect(lambda e, n, c=chat_id: self._on_done(c, e, n))
+        worker.done.connect(
+            lambda e, n, p, c=chat_id: self._on_done(c, e, n, p))
         worker.failed.connect(lambda m, c=chat_id: self._on_failed(c, m))
         worker.notice.connect(self._notice)
         worker.start()
@@ -3700,7 +3983,8 @@ class CriGent(QMainWindow):
             self.tokens_lbl.setText("")
         self._refresh_busy_chats()
 
-    def _on_done(self, chat_id: str, elapsed: float, tokens: int):
+    def _on_done(self, chat_id: str, elapsed: float, tokens: int,
+                 prompt_tokens: int = 0):
         gen = self.gens.get(chat_id)
         if gen is None:
             return
@@ -3711,10 +3995,13 @@ class CriGent(QMainWindow):
 
         if text:
             gen["messages"].append({"role": "assistant", "content": text})
+        self._record_usage(tokens, prompt_tokens, elapsed)
         rate = tokens / elapsed if elapsed > 0 else 0
         stamp = f"{elapsed:.1f}s" if elapsed < 60 else f"{elapsed / 60:.1f}m"
         if visible and self.bubble:
-            self.bubble.set_meta(f"⏱ {stamp}  ·  {rate:.1f} tok/s")
+            self.bubble.set_meta(
+                f"⏱ {stamp}  ·  {rate:.1f} tok/s  ·  "
+                f"{prompt_tokens + tokens:,} tokens")
             # The turn is settled, so it can now be copied or regenerated.
             if text:
                 self.bubble.set_index(len(gen["messages"]) - 1)
@@ -3734,22 +4021,22 @@ class CriGent(QMainWindow):
             # while reasoning must never execute — with Auto-run on, matching
             # against the full buffer would run it.
             acted = strip_reasoning(text)
-            tool_match = TOOL_RE.search(acted) if self.tools_check.isChecked() else None
-            search_match = SEARCH_RE.search(acted) if self.web_check.isChecked() else None
-            fetch_match = FETCH_RE.search(acted) if self.web_check.isChecked() else None
+            command = extract_block(acted, "run") if self.tools_check.isChecked() else None
+            query = extract_block(acted, "search") if self.web_check.isChecked() else None
+            url = extract_block(acted, "fetch") if self.web_check.isChecked() else None
 
-            if tool_match:
+            if command and command.strip():
                 self.tool_round += 1
-                self._offer_tool(chat_id, tool_match.group(1).strip())
-            elif search_match:
+                self._offer_tool(chat_id, command.strip())
+            elif query and query.strip():
                 self.tool_round += 1
-                self._start_search(chat_id, search_match.group(1).strip())
-            elif fetch_match:
+                self._start_search(chat_id, query.strip())
+            elif url and url.strip():
                 self.tool_round += 1
-                self._start_fetch(chat_id, fetch_match.group(1).strip())
+                self._start_fetch(chat_id, url.strip())
             elif self.skills_check.isChecked():
-                skill_match = SKILL_RE.search(acted)
-                parsed = parse_skill_block(skill_match.group(1)) if skill_match else None
+                body = extract_block(acted, "skill")
+                parsed = parse_skill_block(body) if body else None
                 if parsed:
                     self.tool_round += 1
                     self._offer_skill(chat_id, *parsed)
@@ -4560,6 +4847,12 @@ class CriGent(QMainWindow):
                        border-left:3px solid {C['accent']}; border-radius:10px; }}
         #instrTitle {{ color:{C['accent']}; font-size:11px; font-weight:700;
                        letter-spacing:0.6px; }}
+        #statBox {{ background:{C['panel_hi']}; border:1px solid {C['line']};
+                    border-radius:10px; }}
+        #statCap {{ color:{C['faint']}; font-size:11px; font-weight:600;
+                    letter-spacing:0.5px; }}
+        #statValue {{ color:{C['text']}; font-size:26px; font-weight:600; }}
+        #statSub {{ color:{C['faint']}; font-size:11px; }}
         #tasksBlock {{ background:{C['panel_hi']}; border:1px solid {C['line']};
                        border-left:3px solid {C['green']}; border-radius:10px; }}
         #tasksTitle {{ color:{C['green']}; font-size:11px; font-weight:700;
