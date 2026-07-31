@@ -203,7 +203,7 @@ def model_label(name: str) -> tuple[str, str]:
 # Tool-use protocol: the model asks to run a command with a ```run fenced block;
 # the app shows it to the user and only executes on explicit click.
 TOOL_RE = re.compile(r"```run\s*\n(.*?)```", re.S | re.I)
-MAX_TOOL_ROUNDS = 6
+MAX_TOOL_ROUNDS = 12    # a checklist of any size needs room to finish
 # Sent whenever any capability is on. Without it, models fall back on their
 # training and answer "I can't browse the web / run commands", refusing work the
 # app is perfectly able to do.
@@ -237,7 +237,19 @@ AGENT_SYSTEM_PROMPT = (
     "  \"Looking that up now.\n"
     "  ```search\n"
     "  Kingston Fury 32GB DDR5 4800 laptop memory price\n"
-    "  ```\"\n"
+    "  ```\"\n\n"
+    "## Finish the whole job\n\n"
+    "When a request needs more than one step, open your first reply with a "
+    "<tasks> checklist — one line per step, each starting ☐. Then work through "
+    "it. In every following reply, repeat the checklist first, updated: ✓ on "
+    "each step that succeeded, ✗ with a one-line reason on any step that "
+    "genuinely cannot be done, ☐ on what remains.\n\n"
+    "Do not stop while any ☐ remains and your abilities can still make "
+    "progress — write the next action block instead of ending your turn. A "
+    "reply that ends with unticked boxes and no action block is a failure "
+    "unless the user has told you to stop.\n\n"
+    "When every step is ✓ or ✗, close with a short conclusion: what was done, "
+    "what was not and why, and anything the user should do next."
 )
 
 # Sent on its own toggle rather than as part of the agent preamble, because the
@@ -252,6 +264,9 @@ FORMAT_SYSTEM_PROMPT = (
     "<instructions>Steps the user should follow, in order.</instructions>\n"
     "<code lang=\"python\">source code, with the language named</code>\n"
     "<math>Equations and derivations.</math>\n"
+    "<tasks>The checklist for a multi-step job. One task per line, each "
+    "starting with ☐ (to do), ✓ (done) or ✗ (cannot be done — say why on the "
+    "same line).</tasks>\n"
     "<text>Ordinary prose. Optional — untagged text is treated as prose.</text>\n\n"
     "Put your reasoning in <reasoning> and your conclusion outside it, so the "
     "user sees the answer first and can open the thinking if they want it. Do "
@@ -602,15 +617,16 @@ CODE_FENCE_RE = re.compile(r"```(\w*)\n?(.*?)(?:```|$)", re.S)
 # Content tags the model is asked to wrap its output in, so each kind of content
 # gets its own container instead of one undifferentiated wall of prose. Matched
 # unclosed too, so a container appears as soon as the tag opens while streaming.
-TAG_NAMES = ("reasoning", "instructions", "math", "code", "text")
+TAG_NAMES = ("reasoning", "instructions", "math", "code", "text", "tasks")
 TAG_RE = re.compile(
-    r"<(reasoning|instructions|math|code|text)(?:\s+lang=[\"']?([\w+#.-]+)[\"']?)?\s*>"
+    r"<(reasoning|instructions|math|code|text|tasks)(?:\s+lang=[\"']?([\w+#.-]+)[\"']?)?\s*>"
     r"(.*?)(?:</\1\s*>|$)",
     re.S | re.I)
 TAG_LABELS = {
     "reasoning": "Reasoning",
     "instructions": "Instructions",
     "math": "Maths",
+    "tasks": "Tasks",
     "text": "",
     "code": "",
 }
@@ -676,6 +692,12 @@ def _inline(text: str) -> str:
     s = re.sub(r"(?m)^\s*[-*]\s+", "&nbsp;&nbsp;• ", s)
     s = re.sub(r"(?m)^(#{1,4})\s*(.+)$", r"<b>\2</b>", s)
     return s.replace("\n", "<br>")
+
+
+def strip_reasoning(text: str) -> str:
+    """The answer without any thinking — for deciding what to *act* on."""
+    text = re.sub(r"(?s)<think>.*?(?:</think>|$)", "", text)
+    return re.sub(r"(?s)<reasoning\s*>.*?(?:</reasoning\s*>|$)", "", text)
 
 
 def split_think(raw: str):
@@ -993,6 +1015,10 @@ class ChatWorker(QThread):
     failed = pyqtSignal(str)
     notice = pyqtSignal(str)
 
+    # How long the stream may go silent before the model counts as stalled.
+    # Covers a cold load of a large model; a healthy reply never pauses this long.
+    STALL_S = 300
+
     def __init__(self, messages, model: str, num_gpu=None, think=None):
         super().__init__()
         self.messages = messages
@@ -1000,6 +1026,7 @@ class ChatWorker(QThread):
         self.num_gpu = num_gpu
         self.think = think
         self._stop = False
+        self._streamed = False
 
     def stop(self):
         self._stop = True
@@ -1013,6 +1040,11 @@ class ChatWorker(QThread):
                 "This model's output did not match the format Ollama expected, "
                 "so the reply was retried with thinking turned off.")
             outcome, detail = self._attempt(False)
+        if outcome == "error" and not self._streamed and not self._stop:
+            # Nothing reached the user, so a silent retry cannot repeat text.
+            # One attempt: a second identical failure is a real problem.
+            self.notice.emit("The model did not respond — retrying…")
+            outcome, detail = self._attempt(self.think)
         if outcome == "error":
             self.failed.emit(detail)
         elif outcome == "parser-error":
@@ -1029,6 +1061,8 @@ class ChatWorker(QThread):
         t0 = time.time()
         tokens = 0
         streamed = False
+        self._streamed = False
+        thinking_open = False
         try:
             body = {"model": self.model, "messages": self.messages, "stream": True}
             if self.num_gpu is not None:
@@ -1036,7 +1070,7 @@ class ChatWorker(QThread):
             if think is not None:
                 body["think"] = think
             with requests.post(
-                CHAT_URL, json=body, stream=True, timeout=(10, 7200),
+                CHAT_URL, json=body, stream=True, timeout=(10, self.STALL_S),
             ) as resp:
                 if resp.status_code >= 400:
                     # Ollama explains itself in the body; raise_for_status throws
@@ -1063,16 +1097,43 @@ class ChatWorker(QThread):
                         if is_parser_error(detail) and not streamed:
                             return "parser-error", detail
                         return "error", detail
-                    piece = data.get("message", {}).get("content", "")
+                    msg = data.get("message", {})
+                    # Native thinking arrives in its own field, not in content.
+                    # Ignoring it meant the reasoning was never shown or saved —
+                    # wrap it in the same <reasoning> tag models write inline,
+                    # and everything downstream (panel, save, reload) just works.
+                    tpiece = msg.get("thinking", "")
+                    if tpiece:
+                        tokens += 1
+                        streamed = self._streamed = True
+                        if not thinking_open:
+                            thinking_open = True
+                            self.chunk.emit("<reasoning>")
+                        self.chunk.emit(tpiece)
+                    piece = msg.get("content", "")
                     if piece:
                         tokens += 1
-                        streamed = True
+                        streamed = self._streamed = True
+                        if thinking_open:
+                            thinking_open = False
+                            self.chunk.emit("</reasoning>")
                         self.chunk.emit(piece)
                     if data.get("done"):
+                        if thinking_open:      # a reply that never left thinking
+                            self.chunk.emit("</reasoning>")
                         break
             self.done.emit(time.time() - t0, tokens)
             return "ok", ""
+        except requests.exceptions.Timeout:
+            mins = self.STALL_S // 60
+            return "error", (f"The model stopped responding — no output for "
+                             f"{mins} minutes. It may be out of memory or wedged; "
+                             f"try again, or switch model or compute mode.")
         except requests.exceptions.ConnectionError:
+            if streamed:
+                return "error", ("The connection to Ollama dropped mid-reply. "
+                                 "The partial answer is kept above — Regenerate "
+                                 "to try the turn again.")
             return "error", "Cannot reach Ollama on 127.0.0.1:11434."
         except Exception as exc:                                  # noqa: BLE001
             return "error", str(exc)
@@ -1252,13 +1313,25 @@ class Bubble(QWidget):
         _, answer = split_think(self.raw)
         QApplication.clipboard().setText((answer or self.raw).strip())
         self.copy_btn.setText("Copied")
-        # Parented: an unparented singleShot outliving its widget aborts the
-        # process, with no traceback to say why.
-        QTimer.singleShot(1200, self, lambda: self.copy_btn.setText("Copy"))
+        # A parented QTimer dies with the widget. The context-argument form of
+        # singleShot does not exist in this PyQt6 build — passing it raises
+        # inside the click slot, which aborts the whole process.
+        timer = QTimer(self.copy_btn)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: self.copy_btn.setText("Copy"))
+        timer.start(1200)
 
     def set_index(self, index: int):
         """Anchor this bubble to a message, which enables its actions."""
         self.msg_index = index
+        self.actions.show()
+
+    def offer_retry(self):
+        """Actions for a failed turn: it has no message to anchor to, so the
+        regenerate signal is wired by the window to a retry instead."""
+        if hasattr(self, "regen_btn"):
+            self.regen_btn.setText("Retry")
+            self.regen_btn.setToolTip("Try this turn again")
         self.actions.show()
 
     def _clear_body(self):
@@ -1344,7 +1417,8 @@ class Bubble(QWidget):
                 widget.set_text(block[1])
                 self._rendered = list(blocks)
                 return
-            if block[0] in ("instructions", "math") and isinstance(widget, LabelledBlock):
+            if (block[0] in ("instructions", "math", "tasks")
+                    and isinstance(widget, LabelledBlock)):
                 widget.set_body(block[1])
                 self._rendered = list(blocks)
                 return
@@ -1465,14 +1539,16 @@ class LabelledBlock(QFrame):
     def __init__(self, kind: str, body: str, mono: str):
         super().__init__()
         self.kind = kind
-        self.setObjectName("mathBlock" if kind == "math" else "instrBlock")
+        self.setObjectName({"math": "mathBlock",
+                            "tasks": "tasksBlock"}.get(kind, "instrBlock"))
         self.setMaximumWidth(BUBBLE_MAX)
         v = QVBoxLayout(self)
         v.setContentsMargins(14, 10, 14, 12)
         v.setSpacing(6)
 
         title = QLabel(TAG_LABELS.get(kind, kind.title()))
-        title.setObjectName("mathTitle" if kind == "math" else "instrTitle")
+        title.setObjectName({"math": "mathTitle",
+                             "tasks": "tasksTitle"}.get(kind, "instrTitle"))
         v.addWidget(title)
 
         self.body = QLabel()
@@ -1489,7 +1565,35 @@ class LabelledBlock(QFrame):
 
     def set_body(self, body: str):
         self._raw = body
-        self.body.setText(_inline(body.strip()))
+        if self.kind == "tasks":
+            self.body.setText(self._checklist(body))
+        else:
+            self.body.setText(_inline(body.strip()))
+
+    @staticmethod
+    def _checklist(body: str) -> str:
+        """Checklist lines with their state glyph coloured: ✓ done, ✗ cannot
+        be done, ☐ still to do."""
+        out = []
+        for raw_line in body.strip().splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            colour = None
+            if line[0] in "✓✔☑":
+                colour = C["green"]
+            elif line[0] in "✗✘✖":
+                colour = C["red"]
+            elif line[0] in "☐□○-":
+                colour = C["faint"]
+            text = _html.escape(line[1:].strip()) if colour else _html.escape(line)
+            glyph = line[0] if colour else ""
+            if colour:
+                out.append(f'<span style="color:{colour};font-weight:600;">'
+                           f'{glyph}</span>&nbsp; {text}')
+            else:
+                out.append(text)
+        return "<br>".join(out)
 
 
 class ToolCard(QFrame):
@@ -2390,6 +2494,7 @@ class CriGent(QMainWindow):
         self.chat_worker = None
         self.bubble = None
         self.gens = {}                 # chat_id -> live generation state
+        self.pending_actions = {}      # chat_id -> proposal awaiting approval
         self.current_model = ""
         self.tool_round = 0
         self._cmd_worker = None
@@ -3308,11 +3413,6 @@ class CriGent(QMainWindow):
             return False
         if not 0 <= index < len(self.messages):
             return False
-        for bubble in self._bubbles():
-            if bubble.msg_index is not None and bubble.msg_index >= index:
-                self.feed.removeWidget(bubble)
-                bubble.setParent(None)
-                bubble.deleteLater()
         # Editing the opening question would otherwise leave the sidebar showing
         # the old one. Only drop the stored title if it is still the auto one —
         # a title the user typed themselves stays put.
@@ -3326,19 +3426,25 @@ class CriGent(QMainWindow):
             except Exception:                                      # noqa: BLE001
                 pass
 
+        # Held so a regenerate that produces nothing can put them back.
+        self._removed_turns = self.messages[index:]
         del self.messages[index:]
-        self.bubble = None
+        # Rebuild rather than pluck bubbles: tool and web cards carry no message
+        # index, and removing only Bubbles left them orphaned on screen.
+        self._rebuild_feed()
         self._save_current_chat()
         self._reload_chat_list()
         return True
 
     def _regenerate(self, bubble: Bubble):
-        """Ask the same question again, discarding this answer."""
+        """Ask the same question again, discarding this answer — but keep it
+        recoverable until the replacement actually arrives."""
         index = bubble.msg_index
         if index is None or not self._rewind_to(index):
             return
         self.tool_round = 0
-        self._begin_generation("Regenerating…")
+        self._begin_generation("Regenerating…",
+                               restore=getattr(self, "_removed_turns", None))
 
     def _edit_prompt(self, bubble: Bubble):
         """Load a sent prompt back into the composer instead of asking anew."""
@@ -3432,8 +3538,16 @@ class CriGent(QMainWindow):
         sb = self.scroll.verticalScrollBar()
         return sb.value() >= sb.maximum() - 120
 
+    def _later(self, ms: int, fn):
+        """A delayed call that dies with the window. singleShot with a lambda
+        has no receiver, so it outlives a destroyed widget and aborts."""
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(fn)
+        timer.start(ms)
+
     def _scroll_down(self):
-        QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(
+        self._later(0, lambda: self.scroll.verticalScrollBar().setValue(
             self.scroll.verticalScrollBar().maximum()))
 
     # -- generations -------------------------------------------------------
@@ -3489,8 +3603,10 @@ class CriGent(QMainWindow):
             "It will then appear in the selector at the top.")
         return False
 
-    def _begin_generation(self, what: str = "Generating…"):
-        """Answer the conversation as it currently stands."""
+    def _begin_generation(self, what: str = "Generating…", restore=None):
+        """Answer the conversation as it currently stands. `restore` holds
+        turns a rewind removed, returned to the chat if this attempt fails
+        before producing anything."""
         if not self._have_model():
             return
         self._busy_text = what
@@ -3499,6 +3615,7 @@ class CriGent(QMainWindow):
             "buffer": "",
             "flushed": "",
             "messages": self.messages,      # same list object, keeps growing
+            "restore": restore or [],
         }
         self._start_worker(self.current_chat_id)
 
@@ -3613,9 +3730,13 @@ class CriGent(QMainWindow):
             self._hint_if_refused(text)
 
         if self.tool_round < MAX_TOOL_ROUNDS:
-            tool_match = TOOL_RE.search(text) if self.tools_check.isChecked() else None
-            search_match = SEARCH_RE.search(text) if self.web_check.isChecked() else None
-            fetch_match = FETCH_RE.search(text) if self.web_check.isChecked() else None
+            # Scan only the answer. A command the model merely thought about
+            # while reasoning must never execute — with Auto-run on, matching
+            # against the full buffer would run it.
+            acted = strip_reasoning(text)
+            tool_match = TOOL_RE.search(acted) if self.tools_check.isChecked() else None
+            search_match = SEARCH_RE.search(acted) if self.web_check.isChecked() else None
+            fetch_match = FETCH_RE.search(acted) if self.web_check.isChecked() else None
 
             if tool_match:
                 self.tool_round += 1
@@ -3627,7 +3748,7 @@ class CriGent(QMainWindow):
                 self.tool_round += 1
                 self._start_fetch(chat_id, fetch_match.group(1).strip())
             elif self.skills_check.isChecked():
-                skill_match = SKILL_RE.search(text)
+                skill_match = SKILL_RE.search(acted)
                 parsed = parse_skill_block(skill_match.group(1)) if skill_match else None
                 if parsed:
                     self.tool_round += 1
@@ -3635,9 +3756,33 @@ class CriGent(QMainWindow):
 
     def _on_failed(self, chat_id: str, err: str):
         gen = self.gens.get(chat_id)
+
+        # A regenerate that produced nothing must not cost the old answer:
+        # put the turns the rewind removed straight back.
+        restored = False
+        if gen and gen.get("restore") and not gen["buffer"]:
+            gen["messages"].extend(gen["restore"])
+            restored = True
+
         if chat_id == self.current_chat_id and self.bubble:
-            self.bubble.set_error(err)
-            self.bubble = None
+            if restored:
+                # The reload below rebuilds the feed from the restored messages.
+                self.bubble = None
+            elif gen and gen["buffer"]:
+                # Keep what did arrive instead of wiping it with an error box.
+                self._flush()
+                self.bubble.set_meta("⚠ interrupted — the reply above is partial")
+                self.bubble.offer_retry()
+                self.bubble.regenerate.connect(
+                    lambda w=self.bubble: self._retry_turn(w))
+                self._notice(err)
+                self.bubble = None
+            else:
+                self.bubble.set_error(err)
+                self.bubble.offer_retry()
+                self.bubble.regenerate.connect(
+                    lambda w=self.bubble: self._retry_turn(w))
+                self.bubble = None
         elif gen is not None:
             self._notice_for_chat(chat_id, err)
         if gen is not None:
@@ -3645,6 +3790,23 @@ class CriGent(QMainWindow):
         self.gens.pop(chat_id, None)
         self._finish_ui(chat_id)
         self._save_current_chat()
+        if restored and chat_id == self.current_chat_id:
+            # Rebuild, not _load_chat: reload would reset the capability
+            # toggles and kill an agent run the user is in the middle of.
+            self._rebuild_feed()
+            self._scroll_down()
+            self._notice(f"{err}\n\nNothing was changed — the previous answer "
+                         f"was kept.")
+
+    def _retry_turn(self, bubble: Bubble):
+        """Try the last turn again after a failure. The failed bubble goes; the
+        conversation itself was never advanced, so generating just works."""
+        if self._current_gen() is not None:
+            return
+        self.feed.removeWidget(bubble)
+        bubble.setParent(None)
+        bubble.deleteLater()
+        self._begin_generation("Retrying…")
 
     # "I'm unable to browse the web" and friends. Cheap to detect, and worth
     # detecting: the usual cause is simply that the capability is switched off.
@@ -3700,9 +3862,17 @@ class CriGent(QMainWindow):
 
     def _offer_tool(self, chat_id: str, command: str):
         auto = self.autorun_check.isChecked()
+        visible = chat_id == self.current_chat_id
+        if not visible and not auto:
+            # The card used to land in whichever chat was on screen — the wrong
+            # one — and vanish when its own chat was reopened. Held instead,
+            # and offered when that chat is next opened.
+            self.pending_actions[chat_id] = ("tool", command)
+            return
         card = ToolCard(command, self.mono, auto=auto)
-        self.feed.insertWidget(self.feed.count() - 1, card)
-        self._scroll_down()
+        if visible:
+            self.feed.insertWidget(self.feed.count() - 1, card)
+            self._scroll_down()
         if auto:
             self._run_tool(chat_id, card, command)
         else:
@@ -3734,8 +3904,9 @@ class CriGent(QMainWindow):
 
     def _start_search(self, chat_id: str, query: str):
         card = WebCard("search", query, self.mono)
-        self.feed.insertWidget(self.feed.count() - 1, card)
-        self._scroll_down()
+        if chat_id == self.current_chat_id:
+            self.feed.insertWidget(self.feed.count() - 1, card)
+            self._scroll_down()
         worker = SearchWorker(query)
         worker.result.connect(
             lambda results, err, c=card, q=query, k=chat_id:
@@ -3761,8 +3932,9 @@ class CriGent(QMainWindow):
 
     def _start_fetch(self, chat_id: str, url: str):
         card = WebCard("fetch", url, self.mono)
-        self.feed.insertWidget(self.feed.count() - 1, card)
-        self._scroll_down()
+        if chat_id == self.current_chat_id:
+            self.feed.insertWidget(self.feed.count() - 1, card)
+            self._scroll_down()
         worker = FetchWorker(url)
         worker.result.connect(
             lambda text, err, c=card, u=url, k=chat_id: self._fetch_result(k, c, u, text, err))
@@ -3779,6 +3951,9 @@ class CriGent(QMainWindow):
         self._continue(chat_id, f"[Web fetch result]\n{summary}")
 
     def _offer_skill(self, chat_id: str, name: str, content: str):
+        if chat_id != self.current_chat_id:
+            self.pending_actions[chat_id] = ("skill", (name, content))
+            return
         card = SkillCard(name, content, self.mono)
         card.save_clicked.connect(
             lambda c=card, n=name, ct=content, k=chat_id:
@@ -3918,18 +4093,17 @@ class CriGent(QMainWindow):
                 self.model_combo.setCurrentIndex(idx)
                 self.current_model = model
 
-        if self.messages:
-            self.hint.hide()
-            for i, m in enumerate(self.messages):
-                role = m.get("role", "user")
-                if role == "user":
-                    b = self._add_bubble("user", index=i)
-                else:
-                    _, badge = model_label(self.current_model)
-                    b = self._add_bubble("assistant", badge, index=i)
-                b.set_text(m.get("content", ""))
-        else:
-            self.hint.show()
+        self._rebuild_feed()
+
+        # A command proposed while this chat was off screen is offered now,
+        # instead of having appeared inside whatever chat was open at the time.
+        pend = self.pending_actions.pop(self.current_chat_id, None)
+        if pend is not None:
+            kind, payload = pend
+            if kind == "tool":
+                self._offer_tool(self.current_chat_id, payload)
+            elif kind == "skill":
+                self._offer_skill(self.current_chat_id, *payload)
 
         # If this chat is the one still generating, re-attach so the rest of the
         # reply keeps streaming into view instead of arriving invisibly.
@@ -3945,6 +4119,29 @@ class CriGent(QMainWindow):
 
         self._scroll_down()
         self._reload_chat_list()
+
+    def _rebuild_feed(self):
+        """Redraw the feed from self.messages. Unlike _load_chat this leaves
+        the capability toggles alone, so a rewind mid-agent-run does not
+        silently switch the tools off. Also drops any orphaned tool/web cards,
+        which are not messages and would otherwise survive the rewind."""
+        self.bubble = None
+        while self.feed.count() > 2:
+            item = self.feed.takeAt(1)
+            if item.widget():
+                item.widget().deleteLater()
+        if self.messages:
+            self.hint.hide()
+            for i, m in enumerate(self.messages):
+                role = m.get("role", "user")
+                if role == "user":
+                    b = self._add_bubble("user", index=i)
+                else:
+                    _, badge = model_label(self.current_model)
+                    b = self._add_bubble("assistant", badge, index=i)
+                b.set_text(m.get("content", ""))
+        else:
+            self.hint.show()
 
     def _rename_chat(self, chat_id: str):
         path = self.chats_dir / f"{chat_id}.json"
@@ -3982,6 +4179,7 @@ class CriGent(QMainWindow):
         path = self.chats_dir / f"{chat_id}.json"
         if path.exists():
             path.unlink()
+        self.pending_actions.pop(chat_id, None)
         if chat_id == self.current_chat_id:
             self._new_chat()
         self._reload_chat_list()
@@ -4136,7 +4334,7 @@ class CriGent(QMainWindow):
             self._populate_models()
         except Exception:                                        # noqa: BLE001
             if tries:
-                QTimer.singleShot(1500, lambda: self._recheck(tries - 1))
+                self._later(1500, lambda: self._recheck(tries - 1))
             else:
                 self._set_status("Ollama offline", C["red"])
 
@@ -4361,6 +4559,10 @@ class CriGent(QMainWindow):
         #instrBlock {{ background:{C['panel_hi']}; border:1px solid {C['line']};
                        border-left:3px solid {C['accent']}; border-radius:10px; }}
         #instrTitle {{ color:{C['accent']}; font-size:11px; font-weight:700;
+                       letter-spacing:0.6px; }}
+        #tasksBlock {{ background:{C['panel_hi']}; border:1px solid {C['line']};
+                       border-left:3px solid {C['green']}; border-radius:10px; }}
+        #tasksTitle {{ color:{C['green']}; font-size:11px; font-weight:700;
                        letter-spacing:0.6px; }}
         #mathBlock {{ background:{C['panel_hi']}; border:1px solid {C['line']};
                       border-left:3px solid {C['violet']}; border-radius:10px; }}
