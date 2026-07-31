@@ -33,7 +33,7 @@ from PyQt6.QtCore import (QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRe
                           pyqtSignal)
 from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase,
                          QFontMetrics, QIcon, QLinearGradient, QPainter,
-                         QPainterPath, QPen, QPixmap)
+                         QPainterPath, QPen, QPixmap, QTextCursor)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
                              QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
                              QHBoxLayout, QInputDialog, QLabel, QLineEdit,
@@ -237,7 +237,20 @@ AGENT_SYSTEM_PROMPT = (
     "  \"Looking that up now.\n"
     "  ```search\n"
     "  Kingston Fury 32GB DDR5 4800 laptop memory price\n"
-    "  ```\"\n"
+    "  ```\"\n\n"
+    "## Structuring your reply\n\n"
+    "Wrap each kind of content in its own tag so it is displayed properly. Use "
+    "only these, and always close them:\n\n"
+    "<reasoning>Your thinking. Shown collapsed, so work through the problem "
+    "here rather than in the answer. One thought per line.</reasoning>\n"
+    "<instructions>Steps the user should follow, in order.</instructions>\n"
+    "<code lang=\"python\">source code, with the language named</code>\n"
+    "<math>Equations and derivations.</math>\n"
+    "<text>Ordinary prose. Optional — untagged text is treated as prose.</text>\n\n"
+    "Put your reasoning in <reasoning> and your conclusion outside it, so the "
+    "user sees the answer first and can open the thinking if they want it. Do "
+    "not nest tags. Action blocks (```run, ```search, ```fetch, ```skill) stay "
+    "as fenced blocks and must never be placed inside a tag."
 )
 
 TOOL_SYSTEM_PROMPT = (
@@ -571,14 +584,57 @@ def fit_height(edit, font: QFont, px_pad: int = 30, cap: int = 400) -> int:
 
 CODE_FENCE_RE = re.compile(r"```(\w*)\n?(.*?)(?:```|$)", re.S)
 
+# Content tags the model is asked to wrap its output in, so each kind of content
+# gets its own container instead of one undifferentiated wall of prose. Matched
+# unclosed too, so a container appears as soon as the tag opens while streaming.
+TAG_NAMES = ("reasoning", "instructions", "math", "code", "text")
+TAG_RE = re.compile(
+    r"<(reasoning|instructions|math|code|text)(?:\s+lang=[\"']?([\w+#.-]+)[\"']?)?\s*>"
+    r"(.*?)(?:</\1\s*>|$)",
+    re.S | re.I)
+TAG_LABELS = {
+    "reasoning": "Reasoning",
+    "instructions": "Instructions",
+    "math": "Maths",
+    "text": "",
+    "code": "",
+}
+
 
 def split_blocks(text: str):
-    """Split markdown into an alternating [prose, (lang, code), prose, ...] list.
+    """Split a reply into typed blocks the UI can render in separate containers.
 
-    Prose is further split on blank lines. That keeps each block small, so a
-    streaming reply only has to re-render its final paragraph rather than one
-    ever-growing wall of text.
+    Returns tuples: ("prose", text) | ("code", lang, body) |
+    ("reasoning"|"instructions"|"math", body).
+
+    Prose is further split on blank lines so a streaming reply only re-renders
+    its final paragraph rather than an ever-growing wall of text.
     """
+    blocks = []
+    pos = 0
+    for m in TAG_RE.finditer(text):
+        before = text[pos:m.start()]
+        if before.strip():
+            blocks.extend(_split_fenced(before))
+        kind = m.group(1).lower()
+        lang = (m.group(2) or "").strip()
+        body = m.group(3)
+        if body.strip():
+            if kind == "code":
+                blocks.append(("code", lang, body))
+            elif kind == "text":
+                blocks.extend(_split_fenced(body))
+            else:
+                blocks.append((kind, body))
+        pos = m.end()
+    rest = text[pos:]
+    if rest.strip():
+        blocks.extend(_split_fenced(rest))
+    return blocks
+
+
+def _split_fenced(text: str):
+    """Untagged content: markdown prose with ``` fenced code."""
     parts = CODE_FENCE_RE.split(text)
     blocks = []
     i = 0
@@ -1084,11 +1140,24 @@ class FetchWorker(QThread):
 #  Chat bubble
 # --------------------------------------------------------------------------- #
 
+def auto_title(messages: list) -> str:
+    """A chat's title when the user has not named it: its opening question."""
+    first_user = next((m["content"] for m in messages if m.get("role") == "user"),
+                      "New chat")
+    squashed = " ".join(first_user.split())
+    # Stored long; the sidebar elides it to fit, so nothing is lost here.
+    return squashed[:120] or "New chat"
+
+
 class Bubble(QWidget):
+    regenerate = pyqtSignal()
+    edit_prompt = pyqtSignal()
+
     def __init__(self, role: str, mono: str, badge: str = "ASSISTANT"):
         super().__init__()
         self.role, self.mono = role, mono
         self.raw = ""
+        self.msg_index = None          # position in the chat's message list
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1098,17 +1167,6 @@ class Bubble(QWidget):
         who.setObjectName("who_user" if role == "user" else "who_bot")
         if role == "user":
             who.hide()          # right alignment already says who wrote it
-
-        self.think_btn = QPushButton("▸ reasoning")
-        self.think_btn.setObjectName("thinkBtn")
-        self.think_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.think_btn.clicked.connect(self._toggle)
-        self.think_btn.hide()
-
-        self.think = QLabel()
-        self.think.setObjectName("think")
-        self.think.setWordWrap(True)
-        self.think.hide()
 
         self.bubble_frame = QFrame()
         self.bubble_frame.setObjectName("bubble_user" if role == "user" else "bubble_bot")
@@ -1126,8 +1184,6 @@ class Bubble(QWidget):
 
         align = Qt.AlignmentFlag.AlignRight if role == "user" else Qt.AlignmentFlag.AlignLeft
         outer.addWidget(who, alignment=align)
-        outer.addWidget(self.think_btn, alignment=align)
-        outer.addWidget(self.think, alignment=align)
 
         # A stretch on one side beats an alignment flag here: alignment freezes the
         # frame at its (unreliable) word-wrap sizeHint, which collapses the bubble.
@@ -1141,12 +1197,54 @@ class Bubble(QWidget):
             bubble_row.addWidget(self.bubble_frame, 1)
             bubble_row.addStretch(0)
         outer.addLayout(bubble_row)
+
+        # Per-message actions. Hidden until the turn is settled, so they never
+        # appear on half-streamed text; shown by the window once it knows where
+        # this bubble sits in the conversation.
+        self.actions = QWidget()
+        act = QHBoxLayout(self.actions)
+        act.setContentsMargins(0, 0, 0, 0)
+        act.setSpacing(4)
+        if role == "user":
+            act.addStretch(1)
+        self.copy_btn = self._action("Copy", self._copy_all)
+        act.addWidget(self.copy_btn)
+        if role == "user":
+            self.edit_btn = self._action("Edit", self.edit_prompt.emit,
+                                         "Put this prompt back in the box and "
+                                         "drop everything after it")
+            act.addWidget(self.edit_btn)
+        else:
+            self.regen_btn = self._action("Regenerate", self.regenerate.emit,
+                                          "Answer this turn again")
+            act.addWidget(self.regen_btn)
+        if role != "user":
+            act.addStretch(1)
+        self.actions.hide()
+        outer.addWidget(self.actions)
+
         outer.addWidget(self.meta, alignment=align)
 
-    def _toggle(self):
-        vis = not self.think.isVisible()
-        self.think.setVisible(vis)
-        self.think_btn.setText(("▾ " if vis else "▸ ") + "reasoning")
+    def _action(self, text: str, slot, tip: str = "") -> QPushButton:
+        btn = QPushButton(text)
+        btn.setObjectName("msgAction")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(tip or text)
+        btn.clicked.connect(slot)
+        return btn
+
+    def _copy_all(self):
+        _, answer = split_think(self.raw)
+        QApplication.clipboard().setText((answer or self.raw).strip())
+        self.copy_btn.setText("Copied")
+        # Parented: an unparented singleShot outliving its widget aborts the
+        # process, with no traceback to say why.
+        QTimer.singleShot(1200, self, lambda: self.copy_btn.setText("Copy"))
+
+    def set_index(self, index: int):
+        """Anchor this bubble to a message, which enables its actions."""
+        self.msg_index = index
+        self.actions.show()
 
     def _clear_body(self):
         self._rendered = None
@@ -1174,12 +1272,13 @@ class Bubble(QWidget):
 
     def set_text(self, raw: str):
         self.raw = raw
+        # <think> output is folded into the same ReasoningPanel as an explicit
+        # <reasoning> tag, so there is one place reasoning ever appears.
         reasoning, answer = split_think(raw)
-        if reasoning:
-            self.think_btn.show()
-            self.think.setText(_inline(reasoning))
-
         blocks = split_blocks(answer) if answer else []
+        if reasoning:
+            # Models that emit <think> get the same panel as an explicit tag.
+            blocks = [("reasoning", reasoning)] + blocks
         if not blocks:
             if self._rendered != []:
                 self._clear_body()
@@ -1207,18 +1306,31 @@ class Bubble(QWidget):
         while same < len(prev) and same < len(blocks) and prev[same] == blocks[same]:
             same += 1
 
-        # The usual streaming case: everything settled except the final block.
-        if (same == len(blocks) - 1 == len(prev) - 1
+        # The usual streaming case: everything is settled except one block that
+        # is still growing. Update that one widget instead of rebuilding. Which
+        # block it is depends on the reply: the answer trails the reasoning, but
+        # a <think> trace keeps growing while the answer is already on screen.
+        if (len(prev) == len(blocks) and same < len(blocks)
                 and self.body_layout.count() == len(prev)
-                and prev[same][0] == blocks[same][0]):
+                and prev[same][0] == blocks[same][0]
+                and prev[same + 1:] == blocks[same + 1:]):
             widget = self.body_layout.itemAt(same).widget()
             block = blocks[same]
             if block[0] == "prose" and isinstance(widget, QLabel):
                 widget.setText(_inline(block[1]))
                 self._rendered = list(blocks)
                 return
-            if block[0] == "code" and isinstance(widget, CodeBlock):
+            if (block[0] == "code" and isinstance(widget, CodeBlock)
+                    and block[1] == prev[same][1]):     # same language
                 widget.set_code(block[2])
+                self._rendered = list(blocks)
+                return
+            if block[0] == "reasoning" and isinstance(widget, ReasoningPanel):
+                widget.set_text(block[1])
+                self._rendered = list(blocks)
+                return
+            if block[0] in ("instructions", "math") and isinstance(widget, LabelledBlock):
+                widget.set_body(block[1])
                 self._rendered = list(blocks)
                 return
 
@@ -1230,12 +1342,21 @@ class Bubble(QWidget):
                 widget.setParent(None)
                 widget.deleteLater()
         for block in blocks[same:]:
-            if block[0] == "prose":
-                self.body_layout.addWidget(self._prose_label(_inline(block[1])))
-            else:
-                _, lang, code = block
-                self.body_layout.addWidget(CodeBlock(code, lang, self.mono))
+            self.body_layout.addWidget(self._build(block))
         self._rendered = list(blocks)
+
+    def _build(self, block):
+        kind = block[0]
+        if kind == "prose":
+            return self._prose_label(_inline(block[1]))
+        if kind == "code":
+            _, lang, code = block
+            return CodeBlock(code, lang, self.mono)
+        if kind == "reasoning":
+            panel = ReasoningPanel(self.mono)
+            panel.set_text(block[1])
+            return panel
+        return LabelledBlock(kind, block[1], self.mono)
 
     def set_error(self, text: str):
         self._clear_body()
@@ -1245,6 +1366,112 @@ class Bubble(QWidget):
     def set_meta(self, text: str):
         self.meta.setText(text)
         self.meta.show()
+
+
+class ReasoningPanel(QFrame):
+    """The model's thinking. Collapsed it shows only the newest line, so a long
+    trace never buries the answer; expanded it shows the whole thing, scrolled to
+    the latest line as it arrives."""
+
+    MAX_OPEN_HEIGHT = 260
+
+    def __init__(self, mono: str):
+        super().__init__()
+        self.setObjectName("reasonPanel")
+        self.setMaximumWidth(BUBBLE_MAX)
+        self._lines = []
+        self._open = False
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 8, 12, 8)
+        v.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        self.toggle = QPushButton("▸  Reasoning")
+        self.toggle.setObjectName("reasonToggle")
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.clicked.connect(self.toggle_open)
+        head.addWidget(self.toggle)
+        self.count_lbl = QLabel("")
+        self.count_lbl.setObjectName("reasonCount")
+        head.addWidget(self.count_lbl)
+        head.addStretch()
+        v.addLayout(head)
+
+        # collapsed: just the line currently being thought
+        self.latest = QLabel("")
+        self.latest.setObjectName("reasonLatest")
+        self.latest.setWordWrap(True)
+        v.addWidget(self.latest)
+
+        # expanded: the full trace
+        self.full = QPlainTextEdit()
+        self.full.setObjectName("reasonFull")
+        self.full.setReadOnly(True)
+        self.full.setFont(mono_font(mono, CODE_PX_SM))
+        self.full.setFrameShape(QFrame.Shape.NoFrame)
+        self.full.hide()
+        v.addWidget(self.full)
+
+    def toggle_open(self):
+        self._open = not self._open
+        self.toggle.setText(("▾  " if self._open else "▸  ") + "Reasoning")
+        self.full.setVisible(self._open)
+        self.latest.setVisible(not self._open)
+        if self._open:
+            self._scroll_to_end()
+
+    def set_text(self, text: str):
+        lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+        if lines == self._lines:
+            return
+        self._lines = lines
+        self.count_lbl.setText(f"{len(lines)} line{'s' if len(lines) != 1 else ''}")
+        self.latest.setText(lines[-1] if lines else "…")
+        self.full.setPlainText("\n".join(lines))
+        fm = self.full.fontMetrics()
+        self.full.setFixedHeight(
+            min(int(fm.lineSpacing() * max(1, len(lines))) + 20, self.MAX_OPEN_HEIGHT))
+        if self._open:
+            self._scroll_to_end()
+
+    def _scroll_to_end(self):
+        bar = self.full.verticalScrollBar()
+        bar.setValue(bar.maximum())          # always resting on the newest line
+
+
+class LabelledBlock(QFrame):
+    """Instructions and maths: a titled container so they read as their own thing."""
+
+    def __init__(self, kind: str, body: str, mono: str):
+        super().__init__()
+        self.kind = kind
+        self.setObjectName("mathBlock" if kind == "math" else "instrBlock")
+        self.setMaximumWidth(BUBBLE_MAX)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 10, 14, 12)
+        v.setSpacing(6)
+
+        title = QLabel(TAG_LABELS.get(kind, kind.title()))
+        title.setObjectName("mathTitle" if kind == "math" else "instrTitle")
+        v.addWidget(title)
+
+        self.body = QLabel()
+        # Equations only line up in a monospaced face, and a stylesheet
+        # font-family beats setFont, so maths needs its own styled name.
+        self.body.setObjectName("mathBody" if kind == "math" else "blockBody")
+        self.body.setWordWrap(True)
+        self.body.setTextFormat(Qt.TextFormat.RichText)
+        self.body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        if kind == "math":
+            self.body.setFont(mono_font(mono, CODE_PX))
+        v.addWidget(self.body)
+        self.set_body(body)
+
+    def set_body(self, body: str):
+        self._raw = body
+        self.body.setText(_inline(body.strip()))
 
 
 class ToolCard(QFrame):
@@ -1372,6 +1599,51 @@ class Spinner(QWidget):
         p.setPen(pen)
         p.drawArc(rect, -self._angle * 16, 100 * 16)
         p.end()
+
+
+class BusyStrip(QFrame):
+    """Spinner and status shown inside the composer while a reply is coming in.
+
+    It floats over the input rather than taking layout space, so the box does not
+    jump as generation starts and stops. It anchors itself to the parent's bottom
+    left and follows every resize.
+    """
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setObjectName("busyStrip")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(9, 4, 11, 4)
+        h.setSpacing(8)
+        self.spinner = Spinner(C["accent"], 13)
+        h.addWidget(self.spinner)
+        self.label = QLabel("Generating…")
+        self.label.setObjectName("busyLabel")
+        h.addWidget(self.label)
+        parent.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.parent() and ev.type() == ev.Type.Resize:
+            self._reposition()
+        return False
+
+    def _reposition(self):
+        parent = self.parent()
+        if parent:
+            self.adjustSize()
+            self.move(8, max(0, parent.height() - self.height() - 8))
+
+    def start(self, text: str = "Generating…"):
+        self.label.setText(text)
+        self.spinner.start()
+        self._reposition()
+        self.show()
+        self.raise_()
+
+    def stop(self):
+        self.spinner.stop()
+        self.hide()
 
 
 class ListRow(QWidget):
@@ -2402,6 +2674,12 @@ class CriGent(QMainWindow):
         self.input.installEventFilter(self)
         sv.addWidget(self.input)
 
+        # Sits over the bottom-left of the input while a reply is generating, so
+        # the wait is visible right where you are typing. Typing is still allowed
+        # — the next question can be queued up while this one finishes.
+        self.busy = BusyStrip(self.input)
+        self.busy.hide()
+
         row = QHBoxLayout()
         row.setContentsMargins(4, 0, 4, 2)
         row.setSpacing(6)
@@ -2981,10 +3259,77 @@ class CriGent(QMainWindow):
                 return True
         return super().eventFilter(obj, ev)
 
-    def _add_bubble(self, role: str, badge: str = "ASSISTANT") -> Bubble:
+    def _add_bubble(self, role: str, badge: str = "ASSISTANT",
+                    index: int | None = None) -> Bubble:
         b = Bubble(role, self.mono, badge)
+        if index is not None:
+            b.set_index(index)
+            b.regenerate.connect(lambda w=b: self._regenerate(w))
+            b.edit_prompt.connect(lambda w=b: self._edit_prompt(w))
         self.feed.insertWidget(self.feed.count() - 1, b)
         return b
+
+    def _bubbles(self) -> list:
+        return [self.feed.itemAt(i).widget() for i in range(self.feed.count())
+                if isinstance(self.feed.itemAt(i).widget(), Bubble)]
+
+    def _rewind_to(self, index: int) -> bool:
+        """Drop every message from `index` on, and the bubbles showing them.
+
+        Both regenerating an answer and editing a prompt mean "go back to this
+        point and take a different path", so they share this.
+        """
+        live = self._current_gen()
+        if live and still_running(live["worker"]):
+            self._notice("Wait for the current reply to finish, or press Stop.")
+            return False
+        if not 0 <= index < len(self.messages):
+            return False
+        for bubble in self._bubbles():
+            if bubble.msg_index is not None and bubble.msg_index >= index:
+                self.feed.removeWidget(bubble)
+                bubble.setParent(None)
+                bubble.deleteLater()
+        # Editing the opening question would otherwise leave the sidebar showing
+        # the old one. Only drop the stored title if it is still the auto one —
+        # a title the user typed themselves stays put.
+        path = self.chats_dir / f"{self.current_chat_id}.json"
+        if index == 0 and path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("title", "") == auto_title(self.messages):
+                    data["title"] = ""
+                    _atomic_write_json(path, data)
+            except Exception:                                      # noqa: BLE001
+                pass
+
+        del self.messages[index:]
+        self.bubble = None
+        self._save_current_chat()
+        self._reload_chat_list()
+        return True
+
+    def _regenerate(self, bubble: Bubble):
+        """Ask the same question again, discarding this answer."""
+        index = bubble.msg_index
+        if index is None or not self._rewind_to(index):
+            return
+        self.tool_round = 0
+        self._begin_generation("Regenerating…")
+
+    def _edit_prompt(self, bubble: Bubble):
+        """Load a sent prompt back into the composer instead of asking anew."""
+        index = bubble.msg_index
+        if index is None:
+            return
+        text = self.messages[index].get("content", "") if index < len(self.messages) else ""
+        if not self._rewind_to(index):
+            return
+        self.input.setPlainText(text)
+        self.input.moveCursor(QTextCursor.MoveOperation.End)
+        self.input.setFocus()
+        if not self.messages:
+            self.hint.show()
 
     def _track(self, worker: QThread) -> QThread:
         """Hold a reference until the thread finishes, so it can't be collected
@@ -3078,6 +3423,16 @@ class CriGent(QMainWindow):
     def _current_gen(self):
         return self.gens.get(self.current_chat_id)
 
+    def _set_generating(self, busy: bool, what: str = "Generating…"):
+        """One switch for the whole busy state of the composer."""
+        self.send_btn.setText("Stop" if busy else "Send")
+        self.send_btn.setObjectName("danger" if busy else "primary")
+        self.send_btn.setStyleSheet("")          # forces a restyle from the QSS
+        if busy:
+            self.busy.start(what)
+        else:
+            self.busy.stop()
+
     def _send_or_stop(self):
         live = self._current_gen()
         if live and still_running(live["worker"]):
@@ -3087,23 +3442,35 @@ class CriGent(QMainWindow):
         if not text:
             return
 
-        # Without this the request goes out as {"model": ""} and Ollama answers
-        # 400 "model is required" — technically accurate, useless to a newcomer
-        # who simply has not imported a model yet.
-        if not self.current_model:
-            self._notice(
-                "No model is selected yet. Open the Models page, choose "
-                "“Add model…” and pick a .gguf file — CriGent imports it for you. "
-                "It will then appear in the selector at the top.")
+        if not self._have_model():
             return
 
         self.hint.hide()
-        user = self._add_bubble("user")
+        user = self._add_bubble("user", index=len(self.messages))
         user.set_text(text)
         self.messages.append({"role": "user", "content": text})
         self.input.clear()
         self.tool_round = 0
         self._save_current_chat()
+        self._begin_generation()
+
+    def _have_model(self) -> bool:
+        # Without this the request goes out as {"model": ""} and Ollama answers
+        # 400 "model is required" — technically accurate, useless to a newcomer
+        # who simply has not imported a model yet.
+        if self.current_model:
+            return True
+        self._notice(
+            "No model is selected yet. Open the Models page, choose "
+            "“Add model…” and pick a .gguf file — CriGent imports it for you. "
+            "It will then appear in the selector at the top.")
+        return False
+
+    def _begin_generation(self, what: str = "Generating…"):
+        """Answer the conversation as it currently stands."""
+        if not self._have_model():
+            return
+        self._busy_text = what
         self.gens[self.current_chat_id] = {
             "worker": None,
             "buffer": "",
@@ -3124,10 +3491,8 @@ class CriGent(QMainWindow):
             self.bubble = self._add_bubble("assistant", badge)
             self.bubble.set_text("")
             self._scroll_down()
-            self.send_btn.setText("Stop")
-            self.send_btn.setObjectName("danger")
-            self.send_btn.setStyleSheet("")
-            self.tokens_lbl.setText("generating…")
+            self._set_generating(True, getattr(self, "_busy_text", "Generating…"))
+            self.tokens_lbl.setText("")     # the spinner already says this
         self._refresh_busy_chats()
 
         # Each enrichment prompt is opt-in via its toggle, and comes from the
@@ -3188,9 +3553,7 @@ class CriGent(QMainWindow):
             self.flush.stop()
         if chat_id == self.current_chat_id:
             self._flush()
-            self.send_btn.setText("Send")
-            self.send_btn.setObjectName("primary")
-            self.send_btn.setStyleSheet("")
+            self._set_generating(False)
             self.tokens_lbl.setText("")
         self._refresh_busy_chats()
 
@@ -3209,6 +3572,11 @@ class CriGent(QMainWindow):
         stamp = f"{elapsed:.1f}s" if elapsed < 60 else f"{elapsed / 60:.1f}m"
         if visible and self.bubble:
             self.bubble.set_meta(f"⏱ {stamp}  ·  {rate:.1f} tok/s")
+            # The turn is settled, so it can now be copied or regenerated.
+            if text:
+                self.bubble.set_index(len(gen["messages"]) - 1)
+                self.bubble.regenerate.connect(
+                    lambda w=self.bubble: self._regenerate(w))
             self.bubble = None
         # Always written to the chat that asked, which may not be on screen.
         self._save_chat(chat_id, gen["messages"])
@@ -3409,9 +3777,7 @@ class CriGent(QMainWindow):
     # -- chat history ------------------------------------------------------ #
     def _new_chat(self):
         self.bubble = None          # generation continues in its own chat
-        self.send_btn.setText("Send")
-        self.send_btn.setObjectName("primary")
-        self.send_btn.setStyleSheet("")
+        self._set_generating(False)
         while self.feed.count() > 2:                 # keep hint + stretch
             item = self.feed.takeAt(1)
             if item.widget():
@@ -3455,11 +3821,7 @@ class CriGent(QMainWindow):
         if existing_title:
             title = existing_title
         else:
-            first_user = next((m["content"] for m in messages if m["role"] == "user"),
-                              "New chat")
-            squashed = " ".join(first_user.split())
-            # Stored long; the sidebar elides it to fit, so nothing is lost here.
-            title = squashed[:120] or "New chat"
+            title = auto_title(messages)
         data = {
             "id": chat_id, "title": title, "model": self.current_model,
             "created": created, "updated": time.time(), "messages": messages,
@@ -3532,22 +3894,20 @@ class CriGent(QMainWindow):
 
         if self.messages:
             self.hint.hide()
-            for m in self.messages:
+            for i, m in enumerate(self.messages):
                 role = m.get("role", "user")
                 if role == "user":
-                    b = self._add_bubble("user")
+                    b = self._add_bubble("user", index=i)
                 else:
                     _, badge = model_label(self.current_model)
-                    b = self._add_bubble("assistant", badge)
+                    b = self._add_bubble("assistant", badge, index=i)
                 b.set_text(m.get("content", ""))
         else:
             self.hint.show()
 
         # If this chat is the one still generating, re-attach so the rest of the
         # reply keeps streaming into view instead of arriving invisibly.
-        self.send_btn.setText("Send")
-        self.send_btn.setObjectName("primary")
-        self.send_btn.setStyleSheet("")
+        self._set_generating(False)
         gen = self.gens.get(self.current_chat_id)
         if gen is not None:
             _, badge = model_label(self.current_model)
@@ -3555,9 +3915,7 @@ class CriGent(QMainWindow):
             gen["flushed"] = ""
             self.bubble.set_text(gen["buffer"] or "…")
             self.hint.hide()
-            self.send_btn.setText("Stop")
-            self.send_btn.setObjectName("danger")
-            self.send_btn.setStyleSheet("")
+            self._set_generating(True)
 
         self._scroll_down()
         self._reload_chat_list()
@@ -3960,12 +4318,40 @@ class CriGent(QMainWindow):
                         border-radius:14px; }}
         #proseUser, #proseBot {{ background:transparent; color:{C['text']};
                                  font-size:{BODY_PX}px; line-height:158%; }}
-        #think {{ color:{C['faint']}; font-size:12px; background:{C['panel_hi']};
-                  border-left:2px solid {C['line_str']}; padding:10px 14px;
-                  border-radius:8px; max-width:760px; }}
-        #thinkBtn {{ background:transparent; border:none; color:{C['faint']};
-                     font-size:11px; text-align:left; padding:0; }}
-        #thinkBtn:hover {{ color:{C['dim']}; }}
+        /* reasoning: collapsed to its newest line, expandable to the full trace */
+        #reasonPanel {{ background:{C['panel_hi']}; border:1px solid {C['line']};
+                        border-left:3px solid {C['faint']}; border-radius:10px; }}
+        #reasonToggle {{ background:transparent; border:none; color:{C['dim']};
+                         font-size:12px; font-weight:600; text-align:left; padding:0; }}
+        #reasonToggle:hover {{ color:{C['text']}; }}
+        #reasonCount {{ color:{C['faint']}; font-size:11px; }}
+        #reasonLatest {{ color:{C['faint']}; font-size:12px; font-style:italic; }}
+        #reasonFull {{ background:{C['bg']}; border:1px solid {C['line']};
+                       border-radius:8px; color:{C['dim']};
+                       font-family:'{self.mono}'; font-size:{CODE_PX_SM}px;
+                       padding:8px 10px; }}
+
+        /* instructions and maths get their own titled containers */
+        #instrBlock {{ background:{C['panel_hi']}; border:1px solid {C['line']};
+                       border-left:3px solid {C['accent']}; border-radius:10px; }}
+        #instrTitle {{ color:{C['accent']}; font-size:11px; font-weight:700;
+                       letter-spacing:0.6px; }}
+        #mathBlock {{ background:{C['panel_hi']}; border:1px solid {C['line']};
+                      border-left:3px solid {C['violet']}; border-radius:10px; }}
+        #mathTitle {{ color:{C['violet']}; font-size:11px; font-weight:700;
+                      letter-spacing:0.6px; }}
+        #blockBody {{ background:transparent; color:{C['text']}; line-height:155%; }}
+        /* per-message actions: quiet until you go looking for them */
+        #msgAction {{ background:transparent; border:1px solid transparent;
+                      border-radius:7px; color:{C['faint']}; font-size:11px;
+                      padding:3px 9px; }}
+        #msgAction:hover {{ background:{C['panel_hi']}; border-color:{C['line']};
+                            color:{C['text']}; }}
+        #busyStrip {{ background:{C['panel_hi']}; border:1px solid {C['line']};
+                      border-radius:12px; }}
+        #busyLabel {{ color:{C['dim']}; font-size:11px; font-weight:600; }}
+        #mathBody {{ background:transparent; color:{C['text']};
+                     font-family:'{self.mono}'; font-size:{CODE_PX}px; line-height:165%; }}
         #meta {{ color:{C['faint']}; font-size:11px; }}
 
         /* ---- code blocks ---- */
