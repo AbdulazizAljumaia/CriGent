@@ -257,6 +257,9 @@ FORMAT_SYSTEM_PROMPT = (
     "user sees the answer first and can open the thinking if they want it. Do "
     "not nest tags. Action blocks (```run, ```search, ```fetch, ```skill) stay "
     "as fenced blocks and must never be placed inside a tag.\n\n"
+    "Working belongs in a tag, not loose in the sentence. An equation, a "
+    "derivation or step-by-step arithmetic goes in <math>; a sequence of steps "
+    "to follow goes in <instructions>; anything runnable goes in <code>.\n\n"
     "Short conversational replies need no tags at all — do not wrap a one-line "
     "answer in <text> just to have used a tag."
 )
@@ -1411,9 +1414,12 @@ class ReasoningPanel(QFrame):
         head.addStretch()
         v.addLayout(head)
 
-        # collapsed: just the line currently being thought
+        # collapsed: just the line currently being thought. Plain text, not
+        # Qt's auto-detection — thinking is full of angle brackets (`<PID>`,
+        # `a < b`), and guessed rich text swallows them silently.
         self.latest = QLabel("")
         self.latest.setObjectName("reasonLatest")
+        self.latest.setTextFormat(Qt.TextFormat.PlainText)
         self.latest.setWordWrap(True)
         v.addWidget(self.latest)
 
@@ -1690,12 +1696,14 @@ class ListRow(QWidget):
         # and the view hands back a rect too wide to ever need eliding.
         self.label = QLabel(title)
         self.label.setObjectName("rowTitle")
+        self.label.setTextFormat(Qt.TextFormat.PlainText)
         self.label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         texts.addWidget(self.label)
         self.sub = None
         if subtitle:
             self.sub = QLabel(subtitle)
             self.sub.setObjectName("rowSub")
+            self.sub.setTextFormat(Qt.TextFormat.PlainText)
             self.sub.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             texts.addWidget(self.sub)
         row.addLayout(texts, 1)
@@ -2239,6 +2247,7 @@ class SkillCard(QFrame):
 
         name_lbl = QLabel(name)
         name_lbl.setObjectName("skillName")
+        name_lbl.setTextFormat(Qt.TextFormat.PlainText)
         v.addWidget(name_lbl)
 
         self.content_box = QPlainTextEdit(content)
@@ -2347,6 +2356,7 @@ class WebCard(QFrame):
 
         query_lbl = QLabel(query)
         query_lbl.setObjectName("webQuery")
+        query_lbl.setTextFormat(Qt.TextFormat.PlainText)
         query_lbl.setWordWrap(True)
         v.addWidget(query_lbl)
 
