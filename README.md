@@ -2,8 +2,8 @@
 
 **A local AI agent for Windows.** Chat with models that run entirely on your own
 machine, let the agent run commands and search the web with your approval, save
-reusable skills, watch your GPU live, and import new models from a `.gguf` file
-without touching a terminal.
+reusable skills, watch your GPU and memory live, track what you have used, and
+import new models from a `.gguf` file without touching a terminal.
 
 No account, no API key, no telemetry. Nothing leaves the machine unless you
 switch web search on.
@@ -33,12 +33,12 @@ needs a moment to swap the new one into VRAM.
 
 **3 · Keep an eye on your hardware**
 
-The GPU page shows load, VRAM, temperature, power and clock speeds as they
-happen, with two-minute history graphs and a list of what else is using the
-card. Useful for spotting when a model is too large for your VRAM and spilling
-into system memory.
+The Track page shows GPU load, VRAM, **system RAM**, temperature, power and
+clock speeds as they happen, with two-minute history graphs and a list of what
+else is using the card. Useful for spotting when a model is too large for your
+VRAM and spilling into system memory — watch VRAM level off while RAM climbs.
 
-![GPU dashboard](docs/03-gpu-dashboard.png)
+![Track: GPU and RAM](docs/03-track.png)
 
 **4 · Adjust the enrichment prompts — optional**
 
@@ -78,12 +78,47 @@ point, instead of asking again underneath.
 
 ![A tagged reply](docs/06-tagged-reply.png)
 
+**7 · Keep a library of skills**
+
+Skills are reusable instructions you tick on for a conversation. The Skills page
+lists everything you have, shows what each one actually says, and lets you
+rename or rewrite it in place — including the ones the model wrote for you.
+Delete with the × on the row.
+
+![Skills](docs/07-skills.png)
+
+**8 · See what you have used**
+
+Every reply's token count is recorded, so you can see today, the last week, the
+last month and all time at a glance, with a thirty-day chart and a split per
+model. Counted from the figures Ollama reports, and kept on this machine.
+
+![Token usage](docs/08-usage.png)
+
+**9 · Crash log**
+
+If something goes wrong inside CriGent the error is written down instead of
+disappearing with the window. Crashes are grouped by error and then by day, so
+you can tell at a glance whether something is still happening. Stop recording
+whenever you like, and delete a group or the lot.
+
+![Crash log](docs/09-crashes.png)
+
 ---
 
 ## Download
 
 Grab `CriGent.exe` from the [latest release](../../releases/latest) and run it.
 It is a single portable file — no installer, no admin rights.
+
+**If Windows says an "Application Control policy has blocked this file":** that
+is [Smart App Control](https://support.microsoft.com/en-us/topic/what-is-smart-app-control-285ea03d-fa88-4d56-882e-6698afdb7003),
+which refuses unsigned programs it has not seen before. CriGent is not code
+signed — a certificate is an annual cost this project does not carry — so a
+fresh download has no reputation with it. Your options are to turn Smart App
+Control off in **Windows Security → App & browser control**, or to run CriGent
+from source (see [Running from source](#running-from-source)), which is not
+affected.
 
 ## First run
 
@@ -112,6 +147,9 @@ CriGent-data/
   skills.json     your saved skills
   prompts.json    your edited enrichment prompts
   settings.json   runtime path, model folder, compute mode
+  usage.json      tokens per day, for the Usage page
+  crashes.json    recorded errors, for the Crash log page
+  crash.log       the same errors as plain text
 ```
 
 The setup screen shows the folder it will use and how much space is free, and
@@ -132,9 +170,11 @@ points CriGent at the existing one.
 | **Models** | See everything installed with size and quantisation, delete with one click, or add any `.gguf` — CriGent writes the Modelfile and imports it for you. Switch models mid-conversation. |
 | **Tools** | The model can propose a PowerShell command. You see the exact command and click **Run** or **Deny**; its output is fed back so it can continue. |
 | **Web** | Search and read pages when it needs information beyond its training data. Read-only, and every search is shown in the chat. |
-| **Skills** | Reusable instructions you tick on and off per message. Write them yourself, or ask the model to draft one — you approve before it is saved. |
-| **Prompts** | The enrichment prompts behind Tools, Web and Skills are yours to edit. |
-| **GPU** | Live load, VRAM, temperature, power, clocks and per-process usage. |
+| **Skills** | Reusable instructions you tick on and off per message. Write them yourself, or ask the model to draft one — you approve before it is saved. The Skills page is where you read, rename, rewrite and delete them. |
+| **Prompts** | The enrichment prompts behind Layout, Tools, Web and Skills are yours to edit. |
+| **Track** | Live GPU load, VRAM, system RAM, temperature, power, clocks and per-process usage. |
+| **Usage** | Token history — today, last 7 days, last 30 days and all time, with a chart and a per-model split. |
+| **Crashes** | Errors inside CriGent, grouped by kind and day. Switch recording off, or delete what is there. |
 | **Compute** | Force GPU (CUDA), force CPU, or leave it to Ollama. |
 
 ### ⚠️ About Auto-run

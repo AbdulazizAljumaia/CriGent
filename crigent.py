@@ -2,6 +2,7 @@
 search, reusable skills, a live GPU dashboard and a built-in model manager."""
 
 import html as _html
+import ctypes
 import ipaddress
 import json
 import os
@@ -128,7 +129,7 @@ ROOT = _app_dir()
 def set_data_dir(path: Path) -> None:
     """Move CriGent's storage somewhere else and rebind every derived path."""
     global ROOT, CHATS_DIR, SKILLS_PATH, PROMPTS_PATH, SETTINGS_PATH, MODELS_DIR
-    global USAGE_PATH
+    global USAGE_PATH, CRASHES_PATH
     path.mkdir(parents=True, exist_ok=True)
     LOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
     LOCATION_FILE.write_text(json.dumps({"data_dir": str(path)}, indent=2),
@@ -139,6 +140,7 @@ def set_data_dir(path: Path) -> None:
     PROMPTS_PATH = ROOT / "prompts.json"
     SETTINGS_PATH = ROOT / "settings.json"
     USAGE_PATH = ROOT / "usage.json"
+    CRASHES_PATH = ROOT / "crashes.json"
     MODELS_DIR = ROOT / "models"
 OLLAMA_DL_URL = ("https://github.com/ollama/ollama/releases/download/"
                  "v0.32.5/ollama-windows-amd64.zip")
@@ -388,6 +390,43 @@ def parse_skill_block(raw: str):
     return name, content
 
 
+MAX_CRASHES = 200        # newest kept; the file must not grow without bound
+
+
+def crash_logging_enabled() -> bool:
+    """Read the switch from disk rather than a live object: the crash handler
+    runs when things are already going wrong, so it must not depend on the
+    window still being in one piece."""
+    try:
+        return bool(json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+                    .get("log_crashes", True))
+    except Exception:                                              # noqa: BLE001
+        return True
+
+
+def load_crashes() -> list:
+    try:
+        data = json.loads(CRASHES_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:                                              # noqa: BLE001
+        return []
+
+
+def record_crash(kind: str, message: str, trace: str) -> None:
+    try:
+        crashes = load_crashes()
+        crashes.insert(0, {
+            "id": uuid.uuid4().hex[:10],
+            "at": time.time(),
+            "kind": kind,
+            "message": message.strip()[:400],
+            "trace": trace,
+        })
+        _atomic_write_json(CRASHES_PATH, crashes[:MAX_CRASHES])
+    except Exception:                                              # noqa: BLE001
+        pass                       # a failure to log must never mask the crash
+
+
 def load_usage() -> dict:
     """Token history, bucketed by calendar day.
 
@@ -453,7 +492,16 @@ WEB_SYSTEM_PROMPT = (
 PROMPTS_PATH = ROOT / "prompts.json"
 SETTINGS_PATH = ROOT / "settings.json"
 USAGE_PATH = ROOT / "usage.json"
+CRASHES_PATH = ROOT / "crashes.json"
 MODELS_DIR = ROOT / "models"
+
+# Nav order. Pages are looked up by name everywhere else: inserting one here
+# used to silently shift the hard-coded indices that drive per-page refreshes.
+PAGES = ("Chat", "Track", "Usage", "Prompts", "Skills", "Crashes", "Models", "About")
+
+
+def page_index(name: str) -> int:
+    return PAGES.index(name)
 
 # Where the model runs. Ollama takes num_gpu as the count of layers to offload,
 # so 0 pins it to CPU and a high number pushes everything it can onto the GPU.
@@ -547,6 +595,8 @@ C = {
     "red_soft": "#331b20",
     "violet": "#9b8cf0",
     "violet_soft": "#242040",
+    "cyan": "#57bcd9",        # system RAM, so it reads apart from TEMP
+
     "code": "#c6d3e6",        # code foreground
 }
 
@@ -626,11 +676,13 @@ def install_crash_guard() -> Path:
             return
         text = "".join(traceback.format_exception(exc_type, exc, tb))
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            with open(log_path, "a", encoding="utf-8") as fh:
-                fh.write(f"\n===== {stamp} =====\n{text}")
-        except OSError:
-            pass
+        if crash_logging_enabled():
+            try:
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(f"\n===== {stamp} =====\n{text}")
+            except OSError:
+                pass
+            record_crash(exc_type.__name__, str(exc) or exc_type.__name__, text)
         app = QApplication.instance()
         if app is not None:
             for widget in app.topLevelWidgets():
@@ -1022,6 +1074,40 @@ class CodeBlock(QFrame):
 #  Workers
 # --------------------------------------------------------------------------- #
 
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = [("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+def read_ram() -> dict:
+    """System memory, straight from the Windows API.
+
+    ctypes rather than psutil: the whole point of the portable build is that it
+    carries no dependency the user did not ask for, and this is three fields.
+    """
+    try:
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return {}
+        gb = 1024 ** 3
+        total = status.ullTotalPhys / gb
+        avail = status.ullAvailPhys / gb
+        return {"ram_total": total, "ram_used": total - avail,
+                "ram_pct": float(status.dwMemoryLoad),
+                "swap_total": status.ullTotalPageFile / gb,
+                "swap_used": (status.ullTotalPageFile - status.ullAvailPageFile) / gb}
+    except Exception:                                              # noqa: BLE001
+        return {}
+
+
 class GpuWorker(QThread):
     sample = pyqtSignal(dict)
 
@@ -1055,7 +1141,8 @@ class GpuWorker(QThread):
                 capture_output=True, text=True, errors="replace",
                 timeout=5, creationflags=NO_WINDOW)
             if r.returncode != 0:
-                return {"error": (r.stderr or r.stdout).strip() or "nvidia-smi failed"}
+                return {"error": (r.stderr or r.stdout).strip() or "nvidia-smi failed",
+                        **read_ram()}
             row = [c.strip() for c in r.stdout.strip().splitlines()[0].split(",")]
             d = dict(zip(GPU_FIELDS, row))
 
@@ -1066,6 +1153,7 @@ class GpuWorker(QThread):
                     return default
 
             out = {
+                **read_ram(),
                 "name": d.get("name", "GPU"),
                 "temp": num("temperature.gpu"),
                 "power": num("power.draw"),
@@ -1936,6 +2024,132 @@ class UsageBars(QWidget):
         p.end()
 
 
+class CrashGroup(QFrame):
+    """One error type, collapsed. Opening it lists the days it happened on;
+    opening a day shows each traceback."""
+
+    delete_requested = pyqtSignal(str)
+
+    def __init__(self, kind: str, records: list, mono: str):
+        super().__init__()
+        self.kind = kind
+        self.mono = mono
+        self.records = records
+        self.setObjectName("crashGroup")
+        self._open = False
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 10, 14, 12)
+        v.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        self.toggle = QPushButton(f"▸  {kind}")
+        self.toggle.setObjectName("crashToggle")
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.clicked.connect(self._toggle)
+        head.addWidget(self.toggle)
+
+        count = QLabel(f"{len(records)}×")
+        count.setObjectName("crashCount")
+        head.addWidget(count)
+
+        newest = max(r.get("at", 0) for r in records)
+        when = QLabel("last " + time.strftime("%d %b %Y, %H:%M", time.localtime(newest)))
+        when.setObjectName("crashWhen")
+        head.addWidget(when)
+        head.addStretch()
+
+        close = QPushButton("×")
+        close.setObjectName("rowClose")
+        close.setFixedSize(22, 22)
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setToolTip(f"Delete every {kind} crash")
+        close.clicked.connect(lambda: self.delete_requested.emit(self.kind))
+        head.addWidget(close)
+        v.addLayout(head)
+
+        # The most recent message, so the group says something while collapsed.
+        latest = QLabel(records[0].get("message", ""))
+        latest.setObjectName("crashLatest")
+        latest.setTextFormat(Qt.TextFormat.PlainText)
+        latest.setWordWrap(True)
+        v.addWidget(latest)
+
+        self.days = QWidget()
+        days_box = QVBoxLayout(self.days)
+        days_box.setContentsMargins(0, 4, 0, 0)
+        days_box.setSpacing(6)
+        by_day = {}
+        for rec in records:
+            day = time.strftime("%Y-%m-%d", time.localtime(rec.get("at", 0)))
+            by_day.setdefault(day, []).append(rec)
+        for day in sorted(by_day, reverse=True):
+            days_box.addWidget(CrashDay(day, by_day[day], mono))
+        self.days.hide()
+        v.addWidget(self.days)
+
+    def _toggle(self):
+        self._open = not self._open
+        self.toggle.setText(("▾  " if self._open else "▸  ") + self.kind)
+        self.days.setVisible(self._open)
+
+
+class CrashDay(QFrame):
+    """One day's crashes of a given kind, collapsed to a date line."""
+
+    def __init__(self, day: str, records: list, mono: str):
+        super().__init__()
+        self.setObjectName("crashDay")
+        self._open = False
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 6, 10, 8)
+        v.setSpacing(6)
+
+        pretty = time.strftime("%A %d %B %Y", time.strptime(day, "%Y-%m-%d"))
+        self.toggle = QPushButton(f"▸  {pretty}   ({len(records)})")
+        self.toggle.setObjectName("crashDayToggle")
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.clicked.connect(self._toggle)
+        v.addWidget(self.toggle)
+
+        self.body = QWidget()
+        box = QVBoxLayout(self.body)
+        box.setContentsMargins(0, 2, 0, 0)
+        box.setSpacing(8)
+        for rec in records:
+            stamp = time.strftime("%H:%M:%S", time.localtime(rec.get("at", 0)))
+            line = QLabel(f"{stamp}  ·  {rec.get('message', '')}")
+            line.setObjectName("crashMsg")
+            line.setTextFormat(Qt.TextFormat.PlainText)
+            line.setWordWrap(True)
+            box.addWidget(line)
+            text = rec.get("trace", "")
+            trace = QPlainTextEdit(text)
+            trace.setObjectName("toolOutput")
+            trace.setReadOnly(True)
+            font = mono_font(mono, CODE_PX_SM)
+            trace.setFont(font)
+            trace.setFrameShape(QFrame.Shape.NoFrame)
+            # Sized to the traceback, capped — a two-line error should not get
+            # the same tall empty box as a deep stack.
+            line_h = QFontMetrics(font).lineSpacing()
+            lines = max(1, len(text.splitlines()))
+            # + document margins and the frame, or the last line is clipped.
+            trace.setFixedHeight(min(240, lines * line_h + 26))
+            box.addWidget(trace)
+        self.body.hide()
+        v.addWidget(self.body)
+        self._pretty = pretty
+        self._n = len(records)
+
+    def _toggle(self):
+        self._open = not self._open
+        self.toggle.setText(("▾  " if self._open else "▸  ")
+                            + f"{self._pretty}   ({self._n})")
+        self.body.setVisible(self._open)
+
+
 class ListRow(QWidget):
     """A sidebar/list row: title that elides to the available width, plus an ×
     that asks for confirmation before deleting. Background stays transparent so
@@ -2690,7 +2904,9 @@ class CriGent(QMainWindow):
         self._build()
         self._reload_chat_list()
         self._reload_skill_list()
+        self._reload_skill_page()
         self._refresh_usage()
+        self._reload_crashes()
 
         self.flush = QTimer(self)                    # batch tokens -> smooth repaints
         self.flush.setInterval(40)
@@ -2737,7 +2953,7 @@ class CriGent(QMainWindow):
         self.nav_group.setExclusive(True)
         nav = QHBoxLayout()
         nav.setSpacing(2)
-        for i, name in enumerate(("Chat", "GPU", "Usage", "Prompts", "Models", "About")):
+        for i, name in enumerate(PAGES):
             btn = QPushButton(name)
             btn.setObjectName("navBtn")
             btn.setCheckable(True)
@@ -2781,26 +2997,34 @@ class CriGent(QMainWindow):
         col.addWidget(head)
 
         self.stack = QStackedWidget()
-        self.stack.addWidget(self._chat_tab())
-        self.stack.addWidget(self._gpu_tab())
-        self.stack.addWidget(self._usage_tab())
-        self.stack.addWidget(self._prompts_tab())
-        self.stack.addWidget(self._models_tab())
-        self.stack.addWidget(self._about_tab())
+        # Built in PAGES order — the two must stay in step, which is why
+        # everything downstream asks for a page by name rather than by number.
+        builders = {
+            "Chat": self._chat_tab, "Track": self._gpu_tab, "Usage": self._usage_tab,
+            "Prompts": self._prompts_tab, "Skills": self._skills_tab,
+            "Crashes": self._crashes_tab, "Models": self._models_tab,
+            "About": self._about_tab,
+        }
+        for name in PAGES:
+            self.stack.addWidget(builders[name]())
         col.addWidget(self.stack, 1)
 
     def _on_nav(self, index: int):
         if hasattr(self, "gpu"):
-            self.gpu.set_active(index == 1)
+            self.gpu.set_active(index == page_index("Track"))
         # Also drive the button state, so programmatic navigation keeps the
         # highlighted tab in sync with the visible page.
         btn = self.nav_group.button(index)
         if btn and not btn.isChecked():
             btn.setChecked(True)
         self.stack.setCurrentIndex(index)
-        if index == 2:
+        if index == page_index("Usage"):
             self._refresh_usage()
-        if index == 4:
+        elif index == page_index("Skills"):
+            self._reload_skill_page()
+        elif index == page_index("Crashes"):
+            self._reload_crashes()
+        elif index == page_index("Models"):
             self._reload_model_list()
 
     def _chat_tab(self) -> QWidget:
@@ -3069,9 +3293,11 @@ class CriGent(QMainWindow):
         g.setSpacing(6)
         self.g_util = RingGauge("GPU LOAD", C["accent"])
         self.g_mem = RingGauge("VRAM", C["violet"])
+        self.g_ram = RingGauge("RAM", C["cyan"])
         self.g_temp = RingGauge("TEMP", C["green"], unit="°")
         self.g_pow = RingGauge("POWER", C["amber"])
-        for i, w in enumerate((self.g_util, self.g_mem, self.g_temp, self.g_pow)):
+        for i, w in enumerate((self.g_util, self.g_mem, self.g_ram,
+                               self.g_temp, self.g_pow)):
             g.addWidget(w, 0, i)
         gauges.box.addLayout(g)
         v.addWidget(gauges)
@@ -3084,8 +3310,12 @@ class CriGent(QMainWindow):
         c2 = Card("VRAM · last 2 min")
         self.spark_mem = Sparkline(C["violet"])
         c2.box.addWidget(self.spark_mem)
+        c3 = Card("System RAM · last 2 min")
+        self.spark_ram = Sparkline(C["cyan"])
+        c3.box.addWidget(self.spark_ram)
         graphs.addWidget(c1)
         graphs.addWidget(c2)
+        graphs.addWidget(c3)
         v.addLayout(graphs)
 
         stats = Card("Details")
@@ -3154,7 +3384,7 @@ class CriGent(QMainWindow):
             _atomic_write_json(USAGE_PATH, self.usage)
         except Exception:                                          # noqa: BLE001
             pass                                                   # never break a reply
-        if self.stack.currentIndex() == 2:
+        if self.stack.currentIndex() == page_index("Usage"):
             self._refresh_usage()
 
     def _usage_tab(self) -> QWidget:
@@ -3242,6 +3472,336 @@ class CriGent(QMainWindow):
             self.usage_models.setText("<br>".join(lines))
         else:
             self.usage_models.setText("No replies recorded in the last 30 days.")
+
+    # -- crashes page ------------------------------------------------------ #
+    def _crashes_tab(self) -> QWidget:
+        page, body = self._page(
+            "Crash log",
+            "If something goes wrong inside CriGent, the error is written here instead "
+            "of vanishing with the window. Grouped by error, then by the day it "
+            "happened. Nothing is sent anywhere — it stays in this folder.")
+
+        bar = Card()
+        row = QHBoxLayout()
+        self.crash_toggle = QPushButton("Recording crashes")
+        self.crash_toggle.setObjectName("pillWeb")
+        self.crash_toggle.setCheckable(True)
+        self.crash_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.crash_toggle.setChecked(bool(self.settings.get("log_crashes", True)))
+        self.crash_toggle.setToolTip(
+            "Turn this off and crashes stop being written down. Anything already "
+            "recorded is kept until you delete it.")
+        self.crash_toggle.toggled.connect(self._on_crash_logging_toggled)
+        row.addWidget(self.crash_toggle)
+
+        self.crash_count = QLabel("")
+        self.crash_count.setObjectName("meta")
+        row.addWidget(self.crash_count)
+        row.addStretch()
+
+        self.crash_where = QLabel("")
+        self.crash_where.setObjectName("meta")
+        self.crash_where.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        row.addWidget(self.crash_where)
+
+        open_btn = QPushButton("Open folder")
+        open_btn.setObjectName("ghostSm")
+        open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        open_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(ROOT))))
+        row.addWidget(open_btn)
+
+        clear_btn = QPushButton("Clear all")
+        clear_btn.setObjectName("ghostSm")
+        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_btn.clicked.connect(self._clear_crashes)
+        row.addWidget(clear_btn)
+        bar.box.addLayout(row)
+        body.addWidget(bar)
+
+        self.crash_holder = QVBoxLayout()
+        self.crash_holder.setSpacing(10)
+        body.addLayout(self.crash_holder)
+
+        self.crash_empty = QLabel("No crashes recorded. That is the idea.")
+        self.crash_empty.setObjectName("pageSub")
+        body.addWidget(self.crash_empty)
+        body.addStretch()
+        return page
+
+    def _on_crash_logging_toggled(self, on: bool):
+        self.crash_toggle.setText("Recording crashes" if on else "Not recording")
+        self.settings["log_crashes"] = bool(on)
+        self._save_settings()
+
+    def _reload_crashes(self):
+        if not hasattr(self, "crash_holder"):
+            return
+        while self.crash_holder.count():
+            item = self.crash_holder.takeAt(0)
+            widget = item.widget()
+            if widget:
+                # setParent(None) as well as deleteLater(): taking a widget out
+                # of a layout does not unparent it, so it keeps painting over
+                # the rebuilt list until the event loop gets round to deleting.
+                widget.setParent(None)
+                widget.deleteLater()
+
+        crashes = load_crashes()
+        self.crash_where.setText(str(CRASHES_PATH))
+        self.crash_where.setToolTip(
+            f"Structured log: {CRASHES_PATH}\nPlain text: {ROOT / 'crash.log'}")
+        self.crash_count.setText(
+            f"{len(crashes)} recorded" if crashes else "")
+        self.crash_empty.setVisible(not crashes)
+
+        # Grouped by error name, then by day — the two things you actually scan
+        # for: "what is breaking" and "is it still breaking".
+        by_kind = {}
+        for rec in crashes:
+            by_kind.setdefault(rec.get("kind", "Error"), []).append(rec)
+        for kind, group in sorted(by_kind.items(), key=lambda kv: -len(kv[1])):
+            panel = CrashGroup(kind, group, self.mono)
+            panel.delete_requested.connect(self._delete_crash_group)
+            self.crash_holder.addWidget(panel)
+
+    def _delete_crash_group(self, kind: str):
+        reply = QMessageBox.question(
+            self, "Delete crashes",
+            f'Delete every recorded "{kind}" crash?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._remove_crashes(lambda rec: rec.get("kind", "Error") != kind)
+
+    def _clear_crashes(self):
+        if not load_crashes():
+            return
+        reply = QMessageBox.question(
+            self, "Clear crash log", "Delete every recorded crash?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self._remove_crashes(lambda rec: False)
+
+    def _remove_crashes(self, keep):
+        """Rewrite the log with only the records `keep` approves."""
+        _atomic_write_json(CRASHES_PATH, [r for r in load_crashes() if keep(r)])
+        self._reload_crashes()
+
+    # -- skills page ------------------------------------------------------- #
+    def _skills_tab(self) -> QWidget:
+        page, body = self._page(
+            "Skills",
+            "Reusable instructions you can switch on for a conversation. Pick one to "
+            "read or edit it here; tick it in the panel beside the chat to apply it.")
+
+        split = QHBoxLayout()
+        split.setSpacing(14)
+
+        # left: the list, with an × per row like every other list in the app
+        left = Card()
+        left.setMaximumWidth(300)
+        new_btn = QPushButton("New skill")
+        new_btn.setObjectName("ghost")
+        new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        new_btn.clicked.connect(self._new_skill_on_page)
+        left.box.addWidget(new_btn)
+
+        self.skill_page_list = QListWidget()
+        self.skill_page_list.setObjectName("plainList")
+        self.skill_page_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.skill_page_list.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.skill_page_list.currentItemChanged.connect(
+            lambda cur, _prev: self._show_skill(
+                cur.data(Qt.ItemDataRole.UserRole) if cur else None))
+        left.box.addWidget(self.skill_page_list, 1)
+
+        self.skill_page_empty = QLabel(
+            "No skills yet. Create one here, or ask the model to write one for you.")
+        self.skill_page_empty.setObjectName("pageSub")
+        self.skill_page_empty.setWordWrap(True)
+        left.box.addWidget(self.skill_page_empty)
+        split.addWidget(left)
+
+        # right: name, content, save
+        right = Card()
+        self.skill_form = QWidget()
+        form = QVBoxLayout(self.skill_form)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+
+        name_row = QHBoxLayout()
+        name_lab = QLabel("Name")
+        name_lab.setObjectName("cardTitle")
+        name_row.addWidget(name_lab)
+        name_row.addStretch()
+        self.skill_meta = QLabel("")
+        self.skill_meta.setObjectName("meta")
+        name_row.addWidget(self.skill_meta)
+        form.addLayout(name_row)
+
+        self.skill_name_box = QLineEdit()
+        self.skill_name_box.setObjectName("input")
+        self.skill_name_box.setPlaceholderText("Web scraping")
+        self.skill_name_box.textEdited.connect(self._on_skill_edited)
+        form.addWidget(self.skill_name_box)
+
+        content_lab = QLabel("Instructions")
+        content_lab.setObjectName("cardTitle")
+        form.addWidget(content_lab)
+        self.skill_content_box = QPlainTextEdit()
+        self.skill_content_box.setObjectName("promptBox")
+        self.skill_content_box.setFont(mono_font(self.mono, CODE_PX))
+        self.skill_content_box.setMinimumHeight(300)
+        self.skill_content_box.textChanged.connect(self._on_skill_edited)
+        form.addWidget(self.skill_content_box, 1)
+
+        actions = QHBoxLayout()
+        self.skill_save_btn = QPushButton("Save skill")
+        self.skill_save_btn.setObjectName("primary")
+        self.skill_save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.skill_save_btn.clicked.connect(self._save_skill_edits)
+        actions.addWidget(self.skill_save_btn)
+        self.skill_revert_btn = QPushButton("Revert")
+        self.skill_revert_btn.setObjectName("ghost")
+        self.skill_revert_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.skill_revert_btn.setToolTip("Discard unsaved edits to this skill")
+        self.skill_revert_btn.clicked.connect(
+            lambda: self._show_skill(self.editing_skill_id, force=True))
+        actions.addWidget(self.skill_revert_btn)
+        self.skill_status = QLabel("")
+        self.skill_status.setObjectName("meta")
+        self.skill_status.setWordWrap(True)
+        actions.addWidget(self.skill_status)
+        actions.addStretch()
+        form.addLayout(actions)
+
+        right.box.addWidget(self.skill_form)
+        self.skill_placeholder = QLabel(
+            "Select a skill on the left, or create one.")
+        self.skill_placeholder.setObjectName("pageSub")
+        right.box.addWidget(self.skill_placeholder)
+        split.addWidget(right, 1)
+
+        body.addLayout(split, 1)
+        self.editing_skill_id = None
+        self._editor_loaded_id = None      # what the boxes are actually showing
+        return page
+
+    def _reload_skill_page(self):
+        """Refill the list, keeping the selection where it can be kept."""
+        if not hasattr(self, "skill_page_list"):
+            return
+        want = self.editing_skill_id
+        self.skill_page_list.blockSignals(True)
+        self.skill_page_list.clear()
+        for sk in self.skills:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, sk["id"])
+            item.setToolTip(sk["name"])
+            lines = len(sk.get("content", "").splitlines())
+            row = ListRow(sk["id"], sk["name"],
+                          f"{lines} line{'' if lines == 1 else 's'}")
+            item.setSizeHint(QSize(row.sizeHint().width(), row.height()))
+            self.skill_page_list.addItem(item)
+            self.skill_page_list.setItemWidget(item, row)
+            row.delete_requested.connect(self._delete_skill)
+            if sk["id"] == want:
+                self.skill_page_list.setCurrentItem(item)
+        self.skill_page_list.blockSignals(False)
+        self.skill_page_empty.setVisible(not self.skills)
+
+        if not self.skills:
+            self._show_skill(None)
+            return
+        current = self.skill_page_list.currentItem()
+        if current is None:
+            self.skill_page_list.setCurrentRow(0)          # emits, loads the first
+            return
+        # Restoring the selection above was done with signals blocked, so the
+        # editor was left showing whatever it had. Reload it only when it is
+        # actually showing something else — otherwise switching tabs with
+        # unsaved edits would silently discard them.
+        selected = current.data(Qt.ItemDataRole.UserRole)
+        if self._editor_loaded_id != selected:
+            self._show_skill(selected, force=True)
+
+    def _show_skill(self, skill_id, force: bool = False):
+        """Load a skill into the editor. Unsaved edits are confirmed first, so
+        clicking another row cannot quietly discard your work."""
+        if (not force and self.editing_skill_id and skill_id != self.editing_skill_id
+                and self._skill_is_dirty()):
+            keep = QMessageBox.question(
+                self, "Unsaved changes",
+                "Save your changes to this skill before leaving it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if keep == QMessageBox.StandardButton.Yes:
+                self._save_skill_edits(quiet=True)
+
+        sk = next((s for s in self.skills if s["id"] == skill_id), None)
+        self.editing_skill_id = sk["id"] if sk else None
+        self._editor_loaded_id = self.editing_skill_id
+        self.skill_form.setVisible(sk is not None)
+        self.skill_placeholder.setVisible(sk is None)
+        self.skill_status.setText("")
+        if not sk:
+            return
+        self.skill_name_box.blockSignals(True)
+        self.skill_name_box.setText(sk["name"])
+        self.skill_name_box.blockSignals(False)
+        self.skill_content_box.blockSignals(True)
+        self.skill_content_box.setPlainText(sk.get("content", ""))
+        self.skill_content_box.blockSignals(False)
+        self.skill_meta.setText(
+            f"updated {time.strftime('%d %b %Y, %H:%M', time.localtime(sk.get('updated', 0)))}"
+            if sk.get("updated") else "")
+        self._set_skill_dirty(False)
+
+    def _skill_is_dirty(self) -> bool:
+        sk = next((s for s in self.skills if s["id"] == self.editing_skill_id), None)
+        if not sk:
+            return False
+        return (self.skill_name_box.text() != sk["name"]
+                or self.skill_content_box.toPlainText() != sk.get("content", ""))
+
+    def _set_skill_dirty(self, dirty: bool):
+        self.skill_save_btn.setEnabled(dirty)
+        self.skill_revert_btn.setEnabled(dirty)
+
+    def _on_skill_edited(self):
+        self._set_skill_dirty(self._skill_is_dirty())
+
+    def _save_skill_edits(self, quiet: bool = False):
+        sk = next((s for s in self.skills if s["id"] == self.editing_skill_id), None)
+        if not sk:
+            return
+        name = self.skill_name_box.text().strip()
+        content = self.skill_content_box.toPlainText().strip()
+        if not name or not content:
+            self.skill_status.setText("A skill needs both a name and instructions.")
+            return
+        sk["name"], sk["content"], sk["updated"] = name, content, time.time()
+        self._save_skills()
+        self._reload_skill_list()        # the chat-side ticks show the new name
+        self._reload_skill_page()
+        self._set_skill_dirty(False)
+        if not quiet:
+            self.skill_status.setText("Saved.")
+
+    def _new_skill_on_page(self):
+        self.skills.append({
+            "id": uuid.uuid4().hex[:10], "name": "New skill",
+            "content": "", "created": time.time(), "updated": time.time(),
+        })
+        self._save_skills()
+        self.editing_skill_id = self.skills[-1]["id"]
+        self._reload_skill_list()
+        self._reload_skill_page()
+        self.skill_name_box.setFocus()
+        self.skill_name_box.selectAll()
 
     def _prompts_tab(self) -> QWidget:
         page, body = self._page(
@@ -4257,6 +4817,7 @@ class CriGent(QMainWindow):
         })
         self._save_skills()
         self._reload_skill_list()
+        self._reload_skill_page()
         self._continue(chat_id, f"[Skill saved: {name}]")
 
     def _discard_skill_card(self, chat_id: str, card: SkillCard, name: str):
@@ -4545,6 +5106,7 @@ class CriGent(QMainWindow):
                 })
                 self._save_skills()
                 self._reload_skill_list()
+                self._reload_skill_page()
 
     def _edit_skill(self, skill_id: str):
         sk = next((s for s in self.skills if s["id"] == skill_id), None)
@@ -4557,6 +5119,7 @@ class CriGent(QMainWindow):
                 sk["name"], sk["content"], sk["updated"] = name, content, time.time()
                 self._save_skills()
                 self._reload_skill_list()
+                self._reload_skill_page()
 
     def _delete_skill(self, skill_id: str):
         sk = next((s for s in self.skills if s["id"] == skill_id), None)
@@ -4571,7 +5134,12 @@ class CriGent(QMainWindow):
     def _remove_skill(self, skill_id: str):
         self.skills = [s for s in self.skills if s["id"] != skill_id]
         self._save_skills()
+        if getattr(self, "editing_skill_id", None) == skill_id:
+            # Drop the editor's claim first, or reloading the page would try to
+            # reselect a skill that no longer exists.
+            self.editing_skill_id = None
         self._reload_skill_list()
+        self._reload_skill_page()
 
     def _on_skill_item_double_clicked(self, item: QListWidgetItem):
         self._edit_skill(item.data(Qt.ItemDataRole.UserRole))
@@ -4672,10 +5240,34 @@ class CriGent(QMainWindow):
         self._scroll_down()
 
     # -- gpu -------------------------------------------------------------- #
+    def _show_ram(self, s: dict):
+        if not s.get("ram_total"):
+            return
+        self.g_ram.set_value(s["ram_pct"],
+                             f"{s['ram_used']:.1f} / {s['ram_total']:.1f} GB")
+        self.spark_ram.push(s["ram_pct"])
+
+    def _ram_rows_html(self, s: dict) -> str:
+        if not s.get("ram_total"):
+            return ""
+        rows = [("System RAM", f"{s['ram_used']:.1f} / {s['ram_total']:.1f} GB "
+                               f"({s['ram_pct']:.0f}%)"),
+                ("Commit charge", f"{s['swap_used']:.1f} / {s['swap_total']:.1f} GB")]
+        body = "".join(
+            f'<tr><td style="color:{C["dim"]};padding:3px 26px 3px 0;">{k}</td>'
+            f'<td style="color:{C["text"]};font-family:{self.mono};">{v}</td></tr>'
+            for k, v in rows)
+        return f"<table cellspacing='0'>{body}</table>"
+
     def _on_gpu(self, s: dict):
+        # RAM comes from the OS, not nvidia-smi, so it keeps updating on a
+        # machine with no NVIDIA card — the page is Track, not GPU.
+        self._show_ram(s)
         if "error" in s:
             self.gpu_name.setText("GPU unavailable")
-            self.detail.setText(f'<span style="color:{C["red"]}">{_html.escape(s["error"])}</span>')
+            self.detail.setText(
+                f'<span style="color:{C["red"]}">{_html.escape(s["error"])}</span>'
+                + self._ram_rows_html(s))
             return
 
         self.gpu_name.setText(s["name"])
@@ -4694,13 +5286,19 @@ class CriGent(QMainWindow):
         self.spark_mem.push(mem_pct)
 
         rows = [
-            ("Memory", f"{s['mem_used']:.0f} / {s['mem_total']:.0f} MiB  ({mem_pct:.1f}%)"),
+            ("VRAM", f"{s['mem_used']:.0f} / {s['mem_total']:.0f} MiB  ({mem_pct:.1f}%)"),
             ("Memory bus", f"{s['mem_util']:.0f}% busy"),
             ("SM clock", f"{s['clock']:.0f} MHz  (max {s['clock_max']:.0f})"),
             ("Board power", f"{s['power']:.1f} W" +
              (f" / {s['power_max']:.0f} W" if s["power_max"] else "")),
             ("Temperature", f"{s['temp']:.0f} °C"),
         ]
+        if s.get("ram_total"):
+            rows += [
+                ("System RAM", f"{s['ram_used']:.1f} / {s['ram_total']:.1f} GB "
+                               f"({s['ram_pct']:.0f}%)"),
+                ("Commit charge", f"{s['swap_used']:.1f} / {s['swap_total']:.1f} GB"),
+            ]
         html = "".join(
             f'<tr><td style="color:{C["dim"]};padding:3px 26px 3px 0;">{k}</td>'
             f'<td style="color:{C["text"]};font-family:{self.mono};">{v}</td></tr>'
@@ -4847,6 +5445,20 @@ class CriGent(QMainWindow):
                        border-left:3px solid {C['accent']}; border-radius:10px; }}
         #instrTitle {{ color:{C['accent']}; font-size:11px; font-weight:700;
                        letter-spacing:0.6px; }}
+        #crashGroup {{ background:{C['panel']}; border:1px solid {C['line']};
+                       border-left:3px solid {C['red']}; border-radius:10px; }}
+        #crashToggle {{ background:transparent; border:none; color:{C['text']};
+                        font-size:13px; font-weight:600; text-align:left; padding:0; }}
+        #crashToggle:hover {{ color:{C['accent_hi']}; }}
+        #crashCount {{ color:{C['red']}; font-size:11px; font-weight:700; }}
+        #crashWhen {{ color:{C['faint']}; font-size:11px; }}
+        #crashLatest {{ color:{C['dim']}; font-size:12px; }}
+        #crashDay {{ background:{C['panel_hi']}; border:1px solid {C['line']};
+                     border-radius:8px; }}
+        #crashDayToggle {{ background:transparent; border:none; color:{C['dim']};
+                           font-size:12px; text-align:left; padding:0; }}
+        #crashDayToggle:hover {{ color:{C['text']}; }}
+        #crashMsg {{ color:{C['text']}; font-size:12px; }}
         #statBox {{ background:{C['panel_hi']}; border:1px solid {C['line']};
                     border-radius:10px; }}
         #statCap {{ color:{C['faint']}; font-size:11px; font-weight:600;
@@ -4932,13 +5544,16 @@ class CriGent(QMainWindow):
         #ghostSm:disabled {{ color:#3f4756; border-color:{C['line']};
                              background:transparent; }}
 
-        QListWidget#chatList, QListWidget#skillList {{ background:transparent; border:none;
-                                                       outline:none; }}
-        QListWidget#chatList::item, QListWidget#skillList::item {{
+        QListWidget#chatList, QListWidget#skillList, QListWidget#plainList {{
+            background:transparent; border:none; outline:none; }}
+        QListWidget#chatList::item, QListWidget#skillList::item,
+        QListWidget#plainList::item {{
             color:{C['dim']}; padding:8px 10px; border-radius:8px; }}
-        QListWidget#chatList::item:hover, QListWidget#skillList::item:hover {{
+        QListWidget#chatList::item:hover, QListWidget#skillList::item:hover,
+        QListWidget#plainList::item:hover {{
             background:{C['panel_hi']}; color:{C['text']}; }}
-        QListWidget#chatList::item:selected {{ background:{C['overlay']}; color:{C['text']}; }}
+        QListWidget#chatList::item:selected, QListWidget#plainList::item:selected {{
+            background:{C['overlay']}; color:{C['text']}; }}
         QListWidget#skillList::item:selected {{ background:{C['panel_hi']}; color:{C['text']}; }}
         QListWidget#skillList::indicator {{ width:14px; height:14px; border-radius:4px;
                                             border:1px solid {C['line_str']};

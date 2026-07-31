@@ -1,11 +1,11 @@
 {
   "2026-07-31": {
     "in": 0,
-    "out": 240,
-    "replies": 12,
-    "seconds": 9.3,
+    "out": 720,
+    "replies": 36,
+    "seconds": 28.1,
     "models": {
-      "stub": 240
+      "stub": 720
     }
   }
 }
