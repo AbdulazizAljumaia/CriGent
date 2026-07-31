@@ -237,7 +237,13 @@ AGENT_SYSTEM_PROMPT = (
     "  \"Looking that up now.\n"
     "  ```search\n"
     "  Kingston Fury 32GB DDR5 4800 laptop memory price\n"
-    "  ```\"\n\n"
+    "  ```\"\n"
+)
+
+# Sent on its own toggle rather than as part of the agent preamble, because the
+# layout applies to every reply — an ordinary chat with no tools switched on
+# still wants its reasoning collapsed and its code in a container.
+FORMAT_SYSTEM_PROMPT = (
     "## Structuring your reply\n\n"
     "Wrap each kind of content in its own tag so it is displayed properly. Use "
     "only these, and always close them:\n\n"
@@ -250,7 +256,9 @@ AGENT_SYSTEM_PROMPT = (
     "Put your reasoning in <reasoning> and your conclusion outside it, so the "
     "user sees the answer first and can open the thinking if they want it. Do "
     "not nest tags. Action blocks (```run, ```search, ```fetch, ```skill) stay "
-    "as fenced blocks and must never be placed inside a tag."
+    "as fenced blocks and must never be placed inside a tag.\n\n"
+    "Short conversational replies need no tags at all — do not wrap a one-line "
+    "answer in <text> just to have used a tag."
 )
 
 TOOL_SYSTEM_PROMPT = (
@@ -350,12 +358,16 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
 # The enrichment prompts the app prepends to a request. Editable in the Prompts
 # page and persisted to prompts.json; these stay the reset-to-default source.
 DEFAULT_PROMPTS = {
+    "format": FORMAT_SYSTEM_PROMPT,
     "agent": AGENT_SYSTEM_PROMPT,
     "tools": TOOL_SYSTEM_PROMPT,
     "web": WEB_SYSTEM_PROMPT,
     "skills": SKILL_SYSTEM_PROMPT,
 }
 PROMPT_META = [
+    ("format", "Layout", "Sent with every message. Asks the model to tag reasoning, "
+                         "instructions, code and maths so each one gets its own container "
+                         "in the reply. Clear this box to switch it off."),
     ("agent", "Agent", "Sent before the others whenever any toggle is on. Tells the model "
                        "its abilities here are real, so it stops replying that it cannot "
                        "browse the web or run commands."),
@@ -2837,8 +2849,9 @@ class CriGent(QMainWindow):
     def _prompts_tab(self) -> QWidget:
         page, body = self._page(
             "Enrichment prompts",
-            "These are prepended to your message when the matching toggle is on. Edit them to "
-            "change how the model uses tools, the web, and skills.")
+            "These are prepended to your message — Layout every time, the rest when the "
+            "matching toggle is on. Edit them to change how the model lays out a reply and "
+            "how it uses tools, the web, and skills.")
 
         self.prompt_boxes = {}
         for key, label, hint in PROMPT_META:
@@ -3511,6 +3524,9 @@ class CriGent(QMainWindow):
         active_skills = self._active_skills_text()
         if active_skills:
             sys_parts.append(active_skills)
+        # Layout applies to every reply, so it is not behind a toggle. An empty
+        # box is how you turn it off, and the filter below honours that.
+        sys_parts.append(self.prompts.get("format", ""))
         sys_parts = [p for p in sys_parts if p.strip()]
 
         payload = list(gen["messages"])
