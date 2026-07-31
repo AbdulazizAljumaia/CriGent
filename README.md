@@ -65,6 +65,19 @@ makes Ollama reload the model, so the next reply takes a little longer to start.
 
 ![Compute selector](docs/05-compute.png)
 
+**6 · Replies laid out by what they contain**
+
+Reasoning, steps, equations and code each get their own container rather than
+arriving as one wall of text. Thinking collapses to its newest line, so you can
+see where the model has got to without it burying the answer — click it to read
+the whole trace.
+
+Every finished message can be copied, a reply can be regenerated, and a prompt
+can be edited: that puts it back in the box and rewinds the conversation to that
+point, instead of asking again underneath.
+
+![A tagged reply](docs/06-tagged-reply.png)
+
 ---
 
 ## Download
@@ -113,7 +126,9 @@ points CriGent at the existing one.
 
 | | |
 |---|---|
-| **Chat** | Streamed replies, real code blocks with a copy button, per-message timing and tokens/sec. Conversations are saved automatically and listed in the sidebar. |
+| **Chat** | Streamed replies, per-message timing and tokens/sec. Conversations are saved automatically and listed in the sidebar. |
+| **Layout** | Reasoning, instructions, maths and code each get their own container, with a copy button on code. Thinking collapses to its latest line and expands to the full trace. |
+| **Redo a turn** | Copy any message, regenerate a reply, or edit a prompt — editing rewinds the conversation to that point rather than asking again underneath. |
 | **Models** | See everything installed with size and quantisation, delete with one click, or add any `.gguf` — CriGent writes the Modelfile and imports it for you. Switch models mid-conversation. |
 | **Tools** | The model can propose a PowerShell command. You see the exact command and click **Run** or **Deny**; its output is fed back so it can continue. |
 | **Web** | Search and read pages when it needs information beyond its training data. Read-only, and every search is shown in the chat. |
