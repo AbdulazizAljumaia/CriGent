@@ -111,14 +111,19 @@ whenever you like, and delete a group or the lot.
 Grab `CriGent.exe` from the [latest release](../../releases/latest) and run it.
 It is a single portable file — no installer, no admin rights.
 
-**If Windows says an "Application Control policy has blocked this file":** that
-is [Smart App Control](https://support.microsoft.com/en-us/topic/what-is-smart-app-control-285ea03d-fa88-4d56-882e-6698afdb7003),
-which refuses unsigned programs it has not seen before. CriGent is not code
-signed — a certificate is an annual cost this project does not carry — so a
-fresh download has no reputation with it. Your options are to turn Smart App
-Control off in **Windows Security → App & browser control**, or to run CriGent
-from source (see [Running from source](#running-from-source)), which is not
-affected.
+The exe is Authenticode signed and timestamped, which is what gets it past
+Windows 11's [Smart App Control](https://support.microsoft.com/en-us/topic/what-is-smart-app-control-285ea03d-fa88-4d56-882e-6698afdb7003) —
+that blocks unsigned programs it has not seen before.
+
+The certificate is **self-signed**, so Windows still shows an *unknown
+publisher* warning the first time you run it. The signature tells you the file
+has not been altered since it was built; it does not vouch for who built it.
+If you want certainty that you have the file published here, check it against
+the SHA-256 printed in the release notes:
+
+```powershell
+Get-FileHash .\CriGent.exe -Algorithm SHA256
+```
 
 ## First run
 
@@ -204,6 +209,28 @@ Build the portable exe:
 pip install pyinstaller
 python -m PyInstaller CriGent.spec --noconfirm
 ```
+
+Sign it, so Smart App Control will let it run. Create the certificate once,
+then sign after every build — an unsigned build is blocked outright on Windows
+11 machines that have Smart App Control switched on:
+
+```powershell
+# once
+New-SelfSignedCertificate -Type CodeSigningCert `
+  -Subject 'CN=Your Name, O=CriGent' `
+  -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(5)
+
+# after each build
+$cert = Get-ChildItem Cert:\CurrentUser\My |
+        Where-Object { $_.Subject -like '*CriGent*' } | Select-Object -First 1
+Set-AuthenticodeSignature -FilePath .\dist\CriGent.exe -Certificate $cert `
+  -HashAlgorithm SHA256 -TimestampServer 'http://timestamp.digicert.com'
+```
+
+The timestamp matters: without it the signature stops being valid the day the
+certificate expires. `Set-AuthenticodeSignature` reports `UnknownError` for a
+self-signed certificate — that is the untrusted-root verdict, not a failure to
+sign, and the file is signed correctly.
 
 Regenerate the icon after changing `paint_logo()`:
 
