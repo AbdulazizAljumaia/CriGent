@@ -65,6 +65,16 @@ makes Ollama reload the model, so the next reply takes a little longer to start.
 
 ![Compute selector](docs/05-compute.png)
 
+**Context** sits beside it. This is how much the model can hold in mind at once —
+the conversation, any files read into it, and the reply being written. Run out
+and the reply simply stops mid-sentence, often mid-thought.
+
+Leave it on **auto** and the model's own setting applies, which is frequently far
+smaller than the model can manage: a model built for 262,000 tokens is commonly
+shipped set to 8,192. If replies keep getting cut short while reading files,
+this is the setting to raise. Bigger costs VRAM, which is why it is a choice
+rather than a raised default.
+
 **6 · Replies laid out by what they contain**
 
 Reasoning, steps, equations and code each get their own container rather than
@@ -210,6 +220,7 @@ points CriGent at the existing one.
 | **Usage** | Token history — today, last 7 days, last 30 days and all time, with a chart and a per-model split. |
 | **Err logs** | Errors and crashes inside CriGent, badged apart and grouped by kind and day, each stamped with the version it happened on. Switch recording off, or delete what is there. |
 | **Compute** | Force GPU (CUDA), force CPU, or leave it to Ollama. |
+| **Context** | How much the model holds in mind at once, from the model's own setting up to 128K. A reply that runs out of room is continued automatically rather than left hanging. |
 
 ### ⚠️ About Auto-run
 

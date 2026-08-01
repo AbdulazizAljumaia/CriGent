@@ -50,7 +50,7 @@ APP_TAGLINE = "A local AI agent — your models, your machine."
 # Shown on the About page and stamped into every logged error, so a report can
 # be tied to a build. Bump this in the same commit as the release tag — a
 # version the app cannot tell you is a version you cannot check.
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.5.4"
 DEV_NAME = "Abdulaziz Al Jumaia"
 DEV_SITE = "https://crimsonlingua.com"
 DEV_LINKEDIN = "https://sa.linkedin.com/in/abdulaziz-al-jumaia"
@@ -608,6 +608,26 @@ COMPUTE_MODES = [
      "Run entirely on the CPU. Much slower, but works with no usable GPU "
      "and frees VRAM for other apps."),
 ]
+
+# How much context to ask Ollama for. "auto" sends nothing, so the model's own
+# Modelfile decides — which is often far smaller than the model can handle (a
+# 262k-capable model shipped with num_ctx 8192). A reply that runs out of room
+# stops mid-sentence, so this is the knob that stops it happening. Bigger costs
+# VRAM, hence a deliberate choice rather than a raised default.
+CONTEXT_SIZES = [
+    ("auto", "Context: auto", None,
+     "Use whatever the model's own Modelfile sets. Often small."),
+    ("8192", "Context: 8K", 8192, "Modest. Fine for chat, tight for reading files."),
+    ("16384", "Context: 16K", 16384, "Room for a long conversation."),
+    ("32768", "Context: 32K", 32768, "Comfortable for reading source files."),
+    ("65536", "Context: 64K", 65536, "Large. Costs noticeably more VRAM."),
+    ("131072", "Context: 128K", 131072,
+     "Very large. Only if the model supports it and you have the VRAM."),
+]
+
+# A reply cut short is continued rather than left hanging, but not forever.
+MAX_CONTINUES = 4
+
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
 
 # The enrichment prompts the app prepends to a request. Editable in the Prompts
@@ -1427,14 +1447,18 @@ class ChatWorker(QThread):
     # Covers a cold load of a large model; a healthy reply never pauses this long.
     STALL_S = 300
 
-    def __init__(self, messages, model: str, num_gpu=None, think=None):
+    def __init__(self, messages, model: str, num_gpu=None, think=None, num_ctx=None):
         super().__init__()
         self.messages = messages
         self.model = model
         self.num_gpu = num_gpu
+        self.num_ctx = num_ctx
         self.think = think
         self._stop = False
         self._streamed = False
+        # Set when Ollama says it stopped because it ran out of room, rather
+        # than because the model was finished.
+        self.truncated = False
 
     def stop(self):
         self._stop = True
@@ -1496,8 +1520,13 @@ class ChatWorker(QThread):
                 if think is not None:
                     body["think"] = think
                 url = CHAT_URL
+            opts = {}
             if self.num_gpu is not None:
-                body["options"] = {"num_gpu": self.num_gpu}
+                opts["num_gpu"] = self.num_gpu
+            if self.num_ctx is not None:
+                opts["num_ctx"] = self.num_ctx
+            if opts:
+                body["options"] = opts
             with requests.post(
                 url, json=body, stream=True, timeout=(10, self.STALL_S),
             ) as resp:
@@ -1569,6 +1598,10 @@ class ChatWorker(QThread):
             # Ollama reports the true counts on the final chunk. Counting
             # chunks, as this used to, only approximates the output and says
             # nothing at all about what the prompt cost.
+            # "length" means it ran out of room, not that it had finished. Left
+            # unread, as it was, a reply that stopped mid-sentence looked like a
+            # completed one: no error, no retry, nothing to click.
+            self.truncated = final.get("done_reason") == "length"
             out_tokens = int(final.get("eval_count") or tokens)
             in_tokens = int(final.get("prompt_eval_count") or 0)
             self.done.emit(time.time() - t0, out_tokens, in_tokens)
@@ -3148,6 +3181,7 @@ class CriGent(QMainWindow):
         self.pending_actions = {}      # chat_id -> proposal awaiting approval
         self.current_model = ""
         self.tool_round = 0
+        self.continue_round = 0
         self._cmd_worker = None
 
         # Workers must stay referenced until they actually finish. Reassigning
@@ -3255,6 +3289,23 @@ class CriGent(QMainWindow):
             "the next reply takes longer to start.")
         self.compute_combo.currentIndexChanged.connect(self._on_compute_changed)
         hb.addWidget(self.compute_combo)
+
+        self.ctx_combo = QComboBox()
+        self.ctx_combo.setObjectName("computePicker")
+        self.ctx_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        for key, label, _, hint in CONTEXT_SIZES:
+            self.ctx_combo.addItem(label, userData=key)
+            self.ctx_combo.setItemData(self.ctx_combo.count() - 1, hint,
+                                       Qt.ItemDataRole.ToolTipRole)
+        idx = self.ctx_combo.findData(self.settings.get("num_ctx", "auto"))
+        self.ctx_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.ctx_combo.setToolTip(
+            "How much the model can hold in mind at once — the conversation, any "
+            "files read into it, and the reply being written. Run out and the "
+            "reply stops mid-sentence. Bigger costs VRAM, and changing it makes "
+            "Ollama reload the model.")
+        self.ctx_combo.currentIndexChanged.connect(self._on_ctx_changed)
+        hb.addWidget(self.ctx_combo)
 
         self.status_dot = QLabel("●")
         self.status_dot.setObjectName("statusDot")
@@ -4157,6 +4208,27 @@ class CriGent(QMainWindow):
                 return num_gpu
         return None
 
+    def _num_ctx(self):
+        """Ollama's num_ctx for the selected size, or None to leave it alone."""
+        key = self.ctx_combo.currentData() if hasattr(self, "ctx_combo") else "auto"
+        for size, _label, value, _hint in CONTEXT_SIZES:
+            if size == key:
+                return value
+        return None
+
+    def _on_ctx_changed(self, _index: int):
+        key = self.ctx_combo.currentData()
+        self.settings["num_ctx"] = key
+        self._save_settings()
+        label = next((l for k, l, _v, _h in CONTEXT_SIZES if k == key), key)
+        note = QLabel(f"— {label.lower()}. Ollama reloads the model on the next "
+                      f"message, so it will be slower to start. —")
+        note.setObjectName("hint")
+        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        note.setWordWrap(True)
+        self.feed.insertWidget(self.feed.count() - 1, note)
+        self._scroll_down()
+
     def _on_compute_changed(self, _index: int):
         key = self.compute_combo.currentData()
         self.settings["compute"] = key
@@ -4571,6 +4643,7 @@ class CriGent(QMainWindow):
         if index is None or not self._rewind_to(index):
             return
         self.tool_round = 0
+        self.continue_round = 0
         self._begin_generation("Regenerating…",
                                restore=getattr(self, "_removed_turns", None))
 
@@ -4716,6 +4789,7 @@ class CriGent(QMainWindow):
         self.messages.append({"role": "user", "content": text})
         self.input.clear()
         self.tool_round = 0
+        self.continue_round = 0
         self._save_current_chat()
         self._begin_generation()
 
@@ -4790,7 +4864,8 @@ class CriGent(QMainWindow):
 
         # Deliberately does not touch other chats' workers. Replies run in
         # parallel, one per conversation.
-        worker = self._track(ChatWorker(payload, self.current_model, self._num_gpu()))
+        worker = self._track(ChatWorker(payload, self.current_model,
+                                        self._num_gpu(), num_ctx=self._num_ctx()))
         gen["worker"] = worker
         self.chat_worker = worker            # the most recent, for close-down
         worker.chunk.connect(lambda t, c=chat_id: self._on_chunk(c, t))
@@ -4840,6 +4915,9 @@ class CriGent(QMainWindow):
         if gen is None:
             return
         text = gen["buffer"]
+        # Held now: gen is dropped below, and the stop reason lives on the
+        # worker that produced this reply.
+        worker = gen.get("worker")
         visible = chat_id == self.current_chat_id
         if visible:
             self._flush()
@@ -4866,6 +4944,14 @@ class CriGent(QMainWindow):
 
         if visible:
             self._hint_if_refused(text)
+
+        # A reply that ran out of room is not a finished reply. Carrying on is
+        # the whole point: it used to stop mid-sentence — often mid-reasoning,
+        # so there was no answer and no action block either — and look exactly
+        # like a model that had simply decided to stop.
+        if getattr(worker, "truncated", False) and text:
+            if self._continue_truncated(chat_id, text):
+                return
 
         if self.tool_round < MAX_TOOL_ROUNDS:
             # Scan only the answer. A command the model merely thought about
@@ -4894,6 +4980,38 @@ class CriGent(QMainWindow):
                     self._offer_skill(chat_id, *parsed)
                 else:
                     self._nudge_if_stranded(chat_id, text)
+
+    def _continue_truncated(self, chat_id: str, text: str) -> bool:
+        """Ask the model to carry on from where it ran out of room.
+
+        Returns True if a continuation was started, so the caller stops — a
+        half-finished reply must not have its action blocks executed. The
+        ```run block in a cut-off message is very often incomplete, and
+        running half a command is worse than running none.
+        """
+        self.continue_round = getattr(self, "continue_round", 0) + 1
+        if self.continue_round > MAX_CONTINUES:
+            self._notice(
+                f"The reply was cut short {MAX_CONTINUES} times running — the "
+                f"context window is too small for this task. Raise it with the "
+                f"Context selector in the top bar and ask again.")
+            record_error("Truncated", "Gave up continuing after "
+                                      f"{MAX_CONTINUES} truncated replies")
+            return False
+
+        record_error("Truncated",
+                     "The model ran out of context and the reply was cut off; "
+                     "CriGent asked it to continue.",
+                     f"Reply ended: …{text[-300:]}")
+        self._notice("The reply ran out of room and stopped mid-sentence — "
+                     "asking the model to carry on from there.")
+        tail = text.rstrip()[-200:]
+        self._continue(chat_id, (
+            "[CriGent] Your previous reply was cut off before you finished — you "
+            "ran out of context, you did not stop by choice. Carry on from exactly "
+            "where it ends, and do not repeat what you already wrote.\n\n"
+            f"It ended with:\n…{tail}"))
+        return True
 
     def _nudge_if_stranded(self, chat_id: str, text: str):
         """Rescue a turn whose only action block was left inside the thinking.
@@ -5160,6 +5278,7 @@ class CriGent(QMainWindow):
         self.messages = []
         self.bubble = None
         self.tool_round = 0
+        self.continue_round = 0
         self.current_chat_id = None
         self.tools_check.setChecked(False)
         self.autorun_check.setChecked(False)
@@ -5255,6 +5374,7 @@ class CriGent(QMainWindow):
         # throw away text that has already streamed in for another chat.
         self.bubble = None
         self.tool_round = 0
+        self.continue_round = 0
         self.tools_check.setChecked(False)      # don't silently resume tool/auto-run for a
         self.autorun_check.setChecked(False)    # chat that was reopened later
 
