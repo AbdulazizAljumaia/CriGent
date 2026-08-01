@@ -196,6 +196,10 @@ def ollama_exe() -> Path | None:
     return None
 HOST = "127.0.0.1:11434"
 CHAT_URL = f"http://{HOST}/api/chat"
+# The plain completion endpoint. Used only as a last resort when /api/chat's
+# parser rejects a model's output — it returns raw text and runs no chat-message
+# parsing, so the format the model drifted from cannot reject the reply.
+GEN_URL = f"http://{HOST}/api/generate"
 TAGS_URL = f"http://{HOST}/api/tags"
 
 def model_label(name: str) -> tuple[str, str]:
@@ -1355,7 +1359,28 @@ def is_parser_error(detail: str) -> bool:
     low = (detail or "").lower()
     return ("peg-native" in low
             or "does not match the expected" in low
+            or "unable to parse" in low and "format" in low
             or "failed to parse" in low and "format" in low)
+
+
+def flatten_for_generate(messages):
+    """Render a conversation as (system, prompt) for /api/generate.
+
+    That endpoint takes one prompt rather than a message list, so roles are
+    labelled in the text instead. Only used on the parser-error fallback path,
+    where a slightly plainer prompt is a fair price for getting an answer at
+    all instead of a dead turn.
+    """
+    system = "\n\n".join(m.get("content", "") for m in messages
+                         if m.get("role") == "system").strip()
+    lines = []
+    for m in messages:
+        if m.get("role") == "system":
+            continue
+        who = "User" if m.get("role") == "user" else "Assistant"
+        lines.append(f"{who}: {m.get('content', '')}")
+    lines.append("Assistant:")
+    return system, "\n\n".join(lines)
 
 
 class ChatWorker(QThread):
@@ -1389,6 +1414,16 @@ class ChatWorker(QThread):
                 "This model's output did not match the format Ollama expected, "
                 "so the reply was retried with thinking turned off.")
             outcome, detail = self._attempt(False)
+        if outcome == "parser-error" and not self._stop:
+            # Last resort: the plain completion endpoint. /api/chat runs a
+            # grammar parser over the reply and 500s when the model's output
+            # drifts from the format its template declares; /api/generate does
+            # no such parsing, so the same generation comes back fine. This is
+            # what turns the error from a dead turn into an answer.
+            self.notice.emit(
+                "Ollama still could not parse the reply, so it was retried "
+                "through the plain completion endpoint.")
+            outcome, detail = self._attempt(False, endpoint="generate")
         if outcome == "error" and not self._streamed and not self._stop:
             # Nothing reached the user, so a silent retry cannot repeat text.
             # One attempt: a second identical failure is a real problem.
@@ -1401,11 +1436,12 @@ class ChatWorker(QThread):
                 "Ollama could not parse this model's output.\n\n"
                 "The model generated a reply, but it did not match the format "
                 "Ollama expects for this architecture — common with merged or "
-                "fine-tuned builds. Retrying without thinking did not help "
-                "either. Try another model, or a different build of this one.\n\n"
+                "fine-tuned builds. Retrying without thinking, and again "
+                "through the plain completion endpoint, did not help either. "
+                "Try another model, or a different build of this one.\n\n"
                 f"Ollama said: {detail}")
 
-    def _attempt(self, think):
+    def _attempt(self, think, endpoint="chat"):
         """Returns (outcome, detail). Emits chunks/done itself on success."""
         t0 = time.time()
         tokens = 0
@@ -1414,13 +1450,22 @@ class ChatWorker(QThread):
         thinking_open = False
         final = {}
         try:
-            body = {"model": self.model, "messages": self.messages, "stream": True}
+            if endpoint == "generate":
+                system, prompt = flatten_for_generate(self.messages)
+                body = {"model": self.model, "prompt": prompt, "stream": True}
+                if system:
+                    body["system"] = system
+                url = GEN_URL
+            else:
+                body = {"model": self.model, "messages": self.messages,
+                        "stream": True}
+                if think is not None:
+                    body["think"] = think
+                url = CHAT_URL
             if self.num_gpu is not None:
                 body["options"] = {"num_gpu": self.num_gpu}
-            if think is not None:
-                body["think"] = think
             with requests.post(
-                CHAT_URL, json=body, stream=True, timeout=(10, self.STALL_S),
+                url, json=body, stream=True, timeout=(10, self.STALL_S),
             ) as resp:
                 if resp.status_code >= 400:
                     # Ollama explains itself in the body; raise_for_status throws
@@ -1442,10 +1487,20 @@ class ChatWorker(QThread):
                     data = json.loads(line)
                     if data.get("error"):
                         detail = str(data["error"])
-                        # A parse failure mid-stream can only be retried while
-                        # nothing has reached the user; otherwise it would repeat.
-                        if is_parser_error(detail) and not streamed:
-                            return "parser-error", detail
+                        if is_parser_error(detail):
+                            # A parse failure mid-stream can only be retried
+                            # while nothing has reached the user; a retry after
+                            # that would repeat text already on screen.
+                            if not streamed:
+                                return "parser-error", detail
+                            # Text did arrive, so generation itself worked and
+                            # only Ollama's parse of it failed. Keeping the
+                            # answer beats throwing it away over that — and it
+                            # lets any run/search block in it still be acted on.
+                            self.notice.emit(
+                                "Ollama could not parse the end of this reply, "
+                                "so it is shown as far as it got.")
+                            break
                         return "error", detail
                     msg = data.get("message", {})
                     # Native thinking arrives in its own field, not in content.
@@ -1460,7 +1515,9 @@ class ChatWorker(QThread):
                             thinking_open = True
                             self.chunk.emit("<reasoning>")
                         self.chunk.emit(tpiece)
-                    piece = msg.get("content", "")
+                    # /api/generate returns its text as "response"; /api/chat
+                    # nests it under "message".
+                    piece = msg.get("content", "") or data.get("response", "")
                     if piece:
                         tokens += 1
                         streamed = self._streamed = True
@@ -1469,10 +1526,12 @@ class ChatWorker(QThread):
                             self.chunk.emit("</reasoning>")
                         self.chunk.emit(piece)
                     if data.get("done"):
-                        if thinking_open:      # a reply that never left thinking
-                            self.chunk.emit("</reasoning>")
                         final = data
                         break
+            # Closed here rather than in the done branch so a reply cut short
+            # by a parse error or a stop still ends its reasoning tag.
+            if thinking_open:
+                self.chunk.emit("</reasoning>")
             # Ollama reports the true counts on the final chunk. Counting
             # chunks, as this used to, only approximates the output and says
             # nothing at all about what the prompt cost.
