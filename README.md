@@ -95,14 +95,24 @@ model. Counted from the figures Ollama reports, and kept on this machine.
 
 ![Token usage](docs/08-usage.png)
 
-**9 · Crash log**
+**9 · Error and crash log**
 
-If something goes wrong inside CriGent the error is written down instead of
-disappearing with the window. Crashes are grouped by error and then by day, so
-you can tell at a glance whether something is still happening. Stop recording
-whenever you like, and delete a group or the lot.
+Everything that goes wrong is written down instead of disappearing: crashes that
+would have closed the window, and errors CriGent reported and carried on from —
+including ones it recovered from silently, which would otherwise leave no trace.
+A red **CRASH** or amber **ERROR** badge tells the two apart, and each entry
+records the version it happened on. Grouped by kind and then by day, so you can
+see at a glance whether something is still happening. Stop recording whenever
+you like, and delete a group or the lot.
 
-![Crash log](docs/09-crashes.png)
+![Error and crash log](docs/09-errlogs.png)
+
+**10 · Which version you are running**
+
+The About page shows the build number, matching the release tags on GitHub — so
+you never have to guess from a file's date.
+
+![About](docs/10-about.png)
 
 ---
 
@@ -172,8 +182,8 @@ CriGent-data/
   prompts.json    your edited enrichment prompts
   settings.json   runtime path, model folder, compute mode
   usage.json      tokens per day, for the Usage page
-  crashes.json    recorded errors, for the Crash log page
-  crash.log       the same errors as plain text
+  crashes.json    recorded errors and crashes, for the Err logs page
+  crash.log       the same entries as plain text
 ```
 
 The setup screen shows the folder it will use and how much space is free, and
@@ -198,7 +208,7 @@ points CriGent at the existing one.
 | **Prompts** | The enrichment prompts behind Layout, Tools, Web and Skills are yours to edit. |
 | **Track** | Live GPU load, VRAM, system RAM, temperature, power, clocks and per-process usage. |
 | **Usage** | Token history — today, last 7 days, last 30 days and all time, with a chart and a per-model split. |
-| **Crashes** | Errors inside CriGent, grouped by kind and day. Switch recording off, or delete what is there. |
+| **Err logs** | Errors and crashes inside CriGent, badged apart and grouped by kind and day, each stamped with the version it happened on. Switch recording off, or delete what is there. |
 | **Compute** | Force GPU (CUDA), force CPU, or leave it to Ollama. |
 
 ### ⚠️ About Auto-run

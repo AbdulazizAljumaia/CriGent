@@ -47,6 +47,10 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
 
 APP_NAME = "CriGent"
 APP_TAGLINE = "A local AI agent — your models, your machine."
+# Shown on the About page and stamped into every logged error, so a report can
+# be tied to a build. Bump this in the same commit as the release tag — a
+# version the app cannot tell you is a version you cannot check.
+APP_VERSION = "1.5.3"
 DEV_NAME = "Abdulaziz Al Jumaia"
 DEV_SITE = "https://crimsonlingua.com"
 DEV_LINKEDIN = "https://sa.linkedin.com/in/abdulaziz-al-jumaia"
@@ -471,19 +475,49 @@ def load_crashes() -> list:
         return []
 
 
-def record_crash(kind: str, message: str, trace: str) -> None:
+def record_crash(kind: str, message: str, trace: str, severity: str = "crash") -> None:
+    """Write one entry to the log.
+
+    `severity` is "crash" for an exception that would have killed the app, and
+    "error" for something that went wrong but was reported and survived. Both
+    live in one file so the page can show them together — an error that keeps
+    recurring is usually the more useful signal of the two.
+    """
     try:
         crashes = load_crashes()
         crashes.insert(0, {
             "id": uuid.uuid4().hex[:10],
             "at": time.time(),
             "kind": kind,
+            "severity": severity,
+            "version": APP_VERSION,
             "message": message.strip()[:400],
             "trace": trace,
         })
         _atomic_write_json(CRASHES_PATH, crashes[:MAX_CRASHES])
     except Exception:                                              # noqa: BLE001
         pass                       # a failure to log must never mask the crash
+
+
+def record_error(kind: str, message: str, detail: str = "") -> None:
+    """Log something that went wrong but did not bring the app down.
+
+    Reaches for the same store as record_crash so there is one place to look.
+    Honours the same on/off switch — a user who turned recording off did not
+    ask for a different category of the same thing.
+    """
+    if not crash_logging_enabled():
+        return
+    record_crash(kind, message, detail or message, severity="error")
+    # Mirrored into the plain-text log the crash guard writes, so that file
+    # stays a complete record rather than half the story.
+    try:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(ROOT / "crash.log", "a", encoding="utf-8") as fh:
+            fh.write(f"\n----- {stamp}  [error] {kind} -----\n"
+                     f"{detail or message}\n")
+    except OSError:
+        pass
 
 
 def load_usage() -> dict:
@@ -556,7 +590,7 @@ MODELS_DIR = ROOT / "models"
 
 # Nav order. Pages are looked up by name everywhere else: inserting one here
 # used to silently shift the hard-coded indices that drive per-page refreshes.
-PAGES = ("Chat", "Track", "Usage", "Prompts", "Skills", "Crashes", "Models", "About")
+PAGES = ("Chat", "Track", "Usage", "Prompts", "Skills", "Err logs", "Models", "About")
 
 
 def page_index(name: str) -> int:
@@ -2259,6 +2293,9 @@ class CrashGroup(QFrame):
         self.records = records
         self.setObjectName("crashGroup")
         self._open = False
+        # A group is a crash group if anything in it was one — a kind that has
+        # ever taken the app down should not read as merely an error.
+        fatal = any(r.get("severity", "crash") == "crash" for r in records)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(14, 10, 14, 12)
@@ -2271,6 +2308,12 @@ class CrashGroup(QFrame):
         self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self.toggle.clicked.connect(self._toggle)
         head.addWidget(self.toggle)
+
+        badge = QLabel("CRASH" if fatal else "ERROR")
+        badge.setObjectName("crashBadge" if fatal else "errorBadge")
+        badge.setToolTip("Took the app down" if fatal else
+                         "Reported and survived")
+        head.addWidget(badge)
 
         count = QLabel(f"{len(records)}×")
         count.setObjectName("crashCount")
@@ -2286,7 +2329,7 @@ class CrashGroup(QFrame):
         close.setObjectName("rowClose")
         close.setFixedSize(22, 22)
         close.setCursor(Qt.CursorShape.PointingHandCursor)
-        close.setToolTip(f"Delete every {kind} crash")
+        close.setToolTip(f"Delete every {kind} entry")
         close.clicked.connect(lambda: self.delete_requested.emit(self.kind))
         head.addWidget(close)
         v.addLayout(head)
@@ -2341,7 +2384,11 @@ class CrashDay(QFrame):
         box.setSpacing(8)
         for rec in records:
             stamp = time.strftime("%H:%M:%S", time.localtime(rec.get("at", 0)))
-            line = QLabel(f"{stamp}  ·  {rec.get('message', '')}")
+            # The build it happened on: without it an old entry looks like a
+            # live bug long after the release that fixed it.
+            ver = rec.get("version")
+            head = f"{stamp}  ·  v{ver}" if ver else stamp
+            line = QLabel(f"{head}  ·  {rec.get('message', '')}")
             line.setObjectName("crashMsg")
             line.setTextFormat(Qt.TextFormat.PlainText)
             line.setWordWrap(True)
@@ -3224,7 +3271,7 @@ class CriGent(QMainWindow):
         builders = {
             "Chat": self._chat_tab, "Track": self._gpu_tab, "Usage": self._usage_tab,
             "Prompts": self._prompts_tab, "Skills": self._skills_tab,
-            "Crashes": self._crashes_tab, "Models": self._models_tab,
+            "Err logs": self._crashes_tab, "Models": self._models_tab,
             "About": self._about_tab,
         }
         for name in PAGES:
@@ -3244,7 +3291,7 @@ class CriGent(QMainWindow):
             self._refresh_usage()
         elif index == page_index("Skills"):
             self._reload_skill_page()
-        elif index == page_index("Crashes"):
+        elif index == page_index("Err logs"):
             self._reload_crashes()
         elif index == page_index("Models"):
             self._reload_model_list()
@@ -3698,21 +3745,22 @@ class CriGent(QMainWindow):
     # -- crashes page ------------------------------------------------------ #
     def _crashes_tab(self) -> QWidget:
         page, body = self._page(
-            "Crash log",
-            "If something goes wrong inside CriGent, the error is written here instead "
-            "of vanishing with the window. Grouped by error, then by the day it "
+            "Error & crash log",
+            "Everything that goes wrong inside CriGent is written here instead of "
+            "vanishing: crashes that would have closed the window, and errors it "
+            "reported and carried on from. Grouped by kind, then by the day it "
             "happened. Nothing is sent anywhere — it stays in this folder.")
 
         bar = Card()
         row = QHBoxLayout()
-        self.crash_toggle = QPushButton("Recording crashes")
+        self.crash_toggle = QPushButton("Recording")
         self.crash_toggle.setObjectName("pillWeb")
         self.crash_toggle.setCheckable(True)
         self.crash_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self.crash_toggle.setChecked(bool(self.settings.get("log_crashes", True)))
         self.crash_toggle.setToolTip(
-            "Turn this off and crashes stop being written down. Anything already "
-            "recorded is kept until you delete it.")
+            "Turn this off and nothing further is written down — errors or "
+            "crashes. Anything already recorded is kept until you delete it.")
         self.crash_toggle.toggled.connect(self._on_crash_logging_toggled)
         row.addWidget(self.crash_toggle)
 
@@ -3746,14 +3794,14 @@ class CriGent(QMainWindow):
         self.crash_holder.setSpacing(10)
         body.addLayout(self.crash_holder)
 
-        self.crash_empty = QLabel("No crashes recorded. That is the idea.")
+        self.crash_empty = QLabel("Nothing recorded — no errors, no crashes.")
         self.crash_empty.setObjectName("pageSub")
         body.addWidget(self.crash_empty)
         body.addStretch()
         return page
 
     def _on_crash_logging_toggled(self, on: bool):
-        self.crash_toggle.setText("Recording crashes" if on else "Not recording")
+        self.crash_toggle.setText("Recording" if on else "Not recording")
         self.settings["log_crashes"] = bool(on)
         self._save_settings()
 
@@ -3774,8 +3822,14 @@ class CriGent(QMainWindow):
         self.crash_where.setText(str(CRASHES_PATH))
         self.crash_where.setToolTip(
             f"Structured log: {CRASHES_PATH}\nPlain text: {ROOT / 'crash.log'}")
-        self.crash_count.setText(
-            f"{len(crashes)} recorded" if crashes else "")
+        fatal = sum(1 for r in crashes if r.get("severity", "crash") == "crash")
+        errs = len(crashes) - fatal
+        parts = []
+        if fatal:
+            parts.append(f"{fatal} crash" + ("es" if fatal != 1 else ""))
+        if errs:
+            parts.append(f"{errs} error" + ("s" if errs != 1 else ""))
+        self.crash_count.setText("  ·  ".join(parts))
         self.crash_empty.setVisible(not crashes)
 
         # Grouped by error name, then by day — the two things you actually scan
@@ -3790,8 +3844,8 @@ class CriGent(QMainWindow):
 
     def _delete_crash_group(self, kind: str):
         reply = QMessageBox.question(
-            self, "Delete crashes",
-            f'Delete every recorded "{kind}" crash?',
+            self, "Delete entries",
+            f'Delete every recorded "{kind}" entry?',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -3801,7 +3855,7 @@ class CriGent(QMainWindow):
         if not load_crashes():
             return
         reply = QMessageBox.question(
-            self, "Clear crash log", "Delete every recorded crash?",
+            self, "Clear log", "Delete every recorded error and crash?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             self._remove_crashes(lambda rec: False)
@@ -4193,9 +4247,19 @@ class CriGent(QMainWindow):
 
         titles = QVBoxLayout()
         titles.setSpacing(4)
+        name_row = QHBoxLayout()
+        name_row.setSpacing(10)
         name = QLabel(APP_NAME)
         name.setObjectName("aboutName")
-        titles.addWidget(name)
+        name_row.addWidget(name)
+        ver = QLabel(f"v{APP_VERSION}")
+        ver.setObjectName("aboutVersion")
+        ver.setToolTip("The build you are running. Releases are tagged with "
+                       "this number on GitHub.")
+        ver.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        name_row.addWidget(ver, 0, Qt.AlignmentFlag.AlignVCenter)
+        name_row.addStretch()
+        titles.addLayout(name_row)
         tag = QLabel(APP_TAGLINE)
         tag.setObjectName("pageSub")
         tag.setWordWrap(True)
@@ -4733,7 +4797,12 @@ class CriGent(QMainWindow):
         worker.done.connect(
             lambda e, n, p, c=chat_id: self._on_done(c, e, n, p))
         worker.failed.connect(lambda m, c=chat_id: self._on_failed(c, m))
+        # Recorded as well as shown. A notice means something went wrong and
+        # was recovered from — with the recovery working, that would otherwise
+        # leave no trace at all, and a fault you cannot see is one you cannot
+        # report.
         worker.notice.connect(self._notice)
+        worker.notice.connect(lambda n: record_error("Recovered", n))
         worker.start()
         self.flush.start()
 
@@ -4854,6 +4923,7 @@ class CriGent(QMainWindow):
                 return
 
     def _on_failed(self, chat_id: str, err: str):
+        record_error("Chat", err)
         gen = self.gens.get(chat_id)
 
         # A regenerate that produced nothing must not cost the old answer:
@@ -5016,6 +5086,7 @@ class CriGent(QMainWindow):
     def _search_result(self, chat_id: str, card: WebCard, query: str,
                        results: list, err: str):
         if err:
+            record_error("Web search", err, f'Query: {query}\n\n{err}')
             card.show_result(f"Error: {err}", ok=False)
             summary = f'Search failed for "{query}": {err}'
         elif not results:
@@ -5042,6 +5113,7 @@ class CriGent(QMainWindow):
 
     def _fetch_result(self, chat_id: str, card: WebCard, url: str, text: str, err: str):
         if err:
+            record_error("Web fetch", err, f"URL: {url}\n\n{err}")
             card.show_result(f"Error: {err}", ok=False)
             summary = f"Fetching {url} failed: {err}"
         else:
@@ -5631,6 +5703,9 @@ class CriGent(QMainWindow):
 
         #pageTitle {{ font-size:20px; font-weight:600; }}
         #aboutName {{ font-size:24px; font-weight:600; letter-spacing:0.2px; }}
+        #aboutVersion {{ color:{C['accent']}; font-size:12px; font-weight:600;
+                         background:{C['overlay']}; border:1px solid {C['line']};
+                         border-radius:999px; padding:2px 10px; }}
         #wizStep {{ color:{C['accent']}; font-size:14px; font-weight:500; }}
         #wizWhere {{ color:{C['dim']}; font-size:12px; background:{C['panel_hi']};
                       border:1px solid {C['line']}; border-radius:8px; padding:9px 12px; }}
@@ -5703,6 +5778,14 @@ class CriGent(QMainWindow):
                         font-size:13px; font-weight:600; text-align:left; padding:0; }}
         #crashToggle:hover {{ color:{C['accent_hi']}; }}
         #crashCount {{ color:{C['red']}; font-size:11px; font-weight:700; }}
+        /* Two severities, told apart at a glance: red took the app down,
+           amber was reported and survived. */
+        #crashBadge {{ color:{C['red']}; font-size:10px; font-weight:700;
+                       letter-spacing:0.6px; border:1px solid {C['red']};
+                       border-radius:999px; padding:1px 7px; }}
+        #errorBadge {{ color:{C['amber']}; font-size:10px; font-weight:700;
+                       letter-spacing:0.6px; border:1px solid {C['amber']};
+                       border-radius:999px; padding:1px 7px; }}
         #crashWhen {{ color:{C['faint']}; font-size:11px; }}
         #crashLatest {{ color:{C['dim']}; font-size:12px; }}
         #crashDay {{ background:{C['panel_hi']}; border:1px solid {C['line']};
