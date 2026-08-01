@@ -275,8 +275,12 @@ FORMAT_SYSTEM_PROMPT = (
     "<text>Ordinary prose. Optional — untagged text is treated as prose.</text>\n\n"
     "Put your reasoning in <reasoning> and your conclusion outside it, so the "
     "user sees the answer first and can open the thinking if they want it. Do "
-    "not nest tags. Action blocks (```run, ```search, ```fetch, ```skill) stay "
-    "as fenced blocks and must never be placed inside a tag.\n\n"
+    "not nest tags.\n\n"
+    "**Close <reasoning> before you do anything else.** An unclosed tag makes "
+    "the rest of your reply count as thinking, and thinking is never acted on.\n\n"
+    "Action blocks (```run, ```search, ```fetch, ```skill) are fenced blocks, "
+    "not tags. Put them at the very end of the reply, outside every tag — one "
+    "inside <reasoning> is ignored and you will never be sent its output.\n\n"
     "Working belongs in a tag, not loose in the sentence. An equation, a "
     "derivation or step-by-step arithmetic goes in <math>; a sequence of steps "
     "to follow goes in <instructions>; anything runnable goes in <code>.\n\n"
@@ -292,6 +296,8 @@ TOOL_SYSTEM_PROMPT = (
     "Then stop. The user sees that exact command and approves or denies it, and you are "
     "given its output (or told it was denied) so you can carry on.\n\n"
     "- One command per block. Ask again on your next turn for the next step.\n"
+    "- The block goes at the end of the reply, outside every tag. A command "
+    "left inside <reasoning> is not run, and no output comes back.\n"
     "- Use `run` only for a command you want executed now. To show an example the user is "
     "not meant to run, use an ordinary ```powershell block instead.\n"
     "- Prefer reading over changing things, and say plainly what a command will do before "
@@ -373,6 +379,55 @@ def extract_block(text: str, tag: str):
     # Unclosed: either still streaming, or the model forgot the last fence.
     # Returning what there is beats discarding the whole block.
     return "\n".join(lines[start:])
+
+
+def _mask_examples(text: str) -> str:
+    """Blank out fenced blocks and <code> tags, keeping every offset.
+
+    So that a command *shown* as an example — ```` ```powershell <run>… ```` or
+    a <code> block explaining the protocol — is not mistaken for one the model
+    is asking to have executed.
+    """
+    chars = list(text)
+    for m in re.finditer(r"(?s)<code(?:\s+[^<>]*)?>(.*?)(?:</code\s*>|$)", text, re.I):
+        for i in range(m.start(1), m.end(1)):
+            chars[i] = " "
+    pos, in_fence = 0, False
+    for line in text.splitlines(keepends=True):
+        if FENCE_RE.match(line.strip()):
+            in_fence = not in_fence
+        elif in_fence:
+            for i in range(pos, pos + len(line)):
+                chars[i] = " "
+        pos += len(line)
+    return "".join(chars)
+
+
+def extract_action(text: str, tag: str):
+    """A run/search/fetch/skill block in either form the models actually emit.
+
+    The protocol asks for a ```run fence. But the same reply also teaches the
+    model <reasoning>, <code> and <tasks> tags, and it generalises: it writes
+    <run>whoami</run> and then stops, waiting for output. Nothing matched the
+    fence, so no command was ever offered, and the conversation deadlocked
+    until the user typed "carry on" — repeatedly, to no effect.
+
+    Accepting both is the fix. The fenced form is preferred when both appear.
+    """
+    body = extract_block(text, tag)
+    if body is not None and body.strip():
+        return body
+    masked = _mask_examples(text)
+    m = re.compile(rf"<{tag}(?:\s+[^<>]*)?>", re.I).search(masked)
+    if not m:
+        return body
+    close = re.compile(rf"</{tag}\s*>", re.I).search(masked, m.end())
+    inner = text[m.end():close.start()] if close else text[m.end():]
+    # Unclosed and running to the end of the reply: take the first line only,
+    # rather than feeding trailing prose to PowerShell.
+    if not close and tag == "run":
+        inner = inner.strip().split("\n")[0]
+    return inner if inner.strip() else body
 
 
 def parse_skill_block(raw: str):
@@ -766,10 +821,91 @@ CODE_FENCE_RE = re.compile(r"```(\w*)\n?(.*?)(?:```|$)", re.S)
 # gets its own container instead of one undifferentiated wall of prose. Matched
 # unclosed too, so a container appears as soon as the tag opens while streaming.
 TAG_NAMES = ("reasoning", "instructions", "math", "code", "text", "tasks")
-TAG_RE = re.compile(
-    r"<(reasoning|instructions|math|code|text|tasks)(?:\s+lang=[\"']?([\w+#.-]+)[\"']?)?\s*>"
-    r"(.*?)(?:</\1\s*>|$)",
-    re.S | re.I)
+ACTION_NAMES = ("run", "search", "fetch", "skill")
+
+TAG_OPEN_RE = re.compile(
+    r"<(reasoning|instructions|math|code|text|tasks|run|search|fetch|skill)"
+    r"(?:\s+lang=[\"']?([\w+#.-]+)[\"']?)?\s*>", re.I)
+# What an *unclosed* tag gives way to: the next tag that opens. Content tags
+# only — deliberately NOT the action tags. If the model never closed
+# <reasoning>, a ```run after it is as likely to be a command it was turning
+# over in its head as one it wants carried out, and guessing wrong executes
+# something nobody approved. It stays inside the thinking, where it cannot run,
+# and _nudge_if_stranded asks the model to close the tag and send it again.
+TAG_BOUNDARY_RE = re.compile(
+    r"<(?:reasoning|instructions|math|code|text|tasks)(?:\s+[^<>]*)?>", re.I)
+ORPHAN_CLOSE_RE = re.compile(
+    r"</(?:reasoning|instructions|math|code|text|tasks)\s*>", re.I)
+
+# Models that keep their thinking in the content stream delimit it with their own
+# control tokens rather than a tag we asked for. Left alone, `<|END_THINKING|>`
+# printed literally in the reply *and* left the <reasoning> before it unclosed.
+CONTROL_TOKEN_RE = re.compile(r"<\|[^|>]*\|>")
+_THINK_OPEN = re.compile(r"^<\|(?:start|begin)[_ ]?(?:of[_ ])?think", re.I)
+_THINK_CLOSE = re.compile(r"^<\|end[_ ]?(?:of[_ ])?think", re.I)
+
+
+def normalize_control_tokens(text: str) -> str:
+    """Rewrite a model's private thinking delimiters as <reasoning> tags.
+
+    `<|START_THINKING|>` / `<|END_THINKING|>` and friends are how several models
+    mark thinking that arrives in the ordinary content stream. They are not
+    anything the user should see, and an `<|END_THINKING|>` where a
+    `</reasoning>` was expected left the tag open — which used to swallow the
+    rest of the reply. Anything else in `<|…|>` form is a control token too, so
+    it is dropped rather than displayed.
+    """
+    # <think> is the same idea in tag form; folding it in here means unclosed
+    # thinking is handled in exactly one place, by iter_tags.
+    if "<think" in text or "</think" in text:
+        text = re.sub(r"(?i)<think\s*>", "<reasoning>", text)
+        text = re.sub(r"(?i)</think\s*>", "</reasoning>", text)
+    if "<|" not in text:
+        return text                      # the overwhelmingly common case
+
+    def sub(m):
+        tok = m.group(0)
+        if _THINK_OPEN.match(tok):
+            return "<reasoning>"
+        if _THINK_CLOSE.match(tok):
+            return "</reasoning>"
+        return ""
+
+    return CONTROL_TOKEN_RE.sub(sub, text)
+
+
+def iter_tags(text: str):
+    """Yield (kind, lang, body, start, end) for each content tag, in order.
+
+    A tag with a closing partner ends there. A tag **without** one ends at the
+    next tag that opens — not at the end of the reply.
+
+    That second rule is the whole point. Models forget `</reasoning>` regularly,
+    and treating the rest of the message as thinking meant the answer, the
+    checklist and any action block after it were all counted as thinking:
+    nothing was rendered outside the collapsed panel, and because commands
+    inside reasoning are deliberately never executed, the run block was
+    silently dropped. The model then sat waiting for output that was never
+    coming, and the user had to keep typing "carry on".
+    """
+    pos = 0
+    while True:
+        m = TAG_OPEN_RE.search(text, pos)
+        if not m:
+            return
+        kind = m.group(1).lower()
+        lang = (m.group(2) or "").strip()
+        close = re.compile(rf"</{kind}\s*>", re.I).search(text, m.end())
+        if close:
+            body, end = text[m.end():close.start()], close.end()
+        else:
+            nxt = TAG_BOUNDARY_RE.search(text, m.end())
+            stop = nxt.start() if nxt else len(text)
+            body, end = text[m.end():stop], stop
+        yield kind, lang, body, m.start(), end
+        pos = end
+
+
 TAG_LABELS = {
     "reasoning": "Reasoning",
     "instructions": "Instructions",
@@ -789,23 +925,29 @@ def split_blocks(text: str):
     Prose is further split on blank lines so a streaming reply only re-renders
     its final paragraph rather than an ever-growing wall of text.
     """
+    text = normalize_control_tokens(text)
     blocks = []
     pos = 0
-    for m in TAG_RE.finditer(text):
-        before = text[pos:m.start()]
+    for kind, lang, body, start, end in iter_tags(text):
+        before = text[pos:start]
         if before.strip():
             blocks.extend(_split_fenced(before))
-        kind = m.group(1).lower()
-        lang = (m.group(2) or "").strip()
-        body = m.group(3)
         if body.strip():
             if kind == "code":
                 blocks.append(("code", lang, body))
+            elif kind in ACTION_NAMES:
+                # Shown the same as the ```run fence it should have been, so a
+                # model that reaches for the tag form still reads correctly.
+                blocks.append(("code", kind, body.strip("\n")))
             elif kind == "text":
                 blocks.extend(_split_fenced(body))
+            elif kind == "reasoning" and blocks and blocks[-1][0] == "reasoning":
+                # One panel, not one per tag. A model that closes and reopens
+                # <reasoning> mid-thought produced a stack of half-empty boxes.
+                blocks[-1] = ("reasoning", blocks[-1][1].rstrip() + "\n" + body.strip())
             else:
                 blocks.append((kind, body))
-        pos = m.end()
+        pos = end
     rest = text[pos:]
     if rest.strip():
         blocks.extend(_split_fenced(rest))
@@ -814,6 +956,8 @@ def split_blocks(text: str):
 
 def _split_fenced(text: str):
     """Untagged content: markdown prose with ``` fenced code."""
+    # A closing tag whose opener was never matched is markup, not prose.
+    text = ORPHAN_CLOSE_RE.sub("", text)
     parts = CODE_FENCE_RE.split(text)
     blocks = []
     i = 0
@@ -842,20 +986,41 @@ def _inline(text: str) -> str:
     return s.replace("\n", "<br>")
 
 
+def _strip_kind(text: str, wanted: str) -> str:
+    out, pos = [], 0
+    for kind, _lang, _body, start, end in iter_tags(text):
+        if kind != wanted:
+            continue
+        out.append(text[pos:start])
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def strip_reasoning(text: str) -> str:
-    """The answer without any thinking — for deciding what to *act* on."""
-    text = re.sub(r"(?s)<think>.*?(?:</think>|$)", "", text)
-    return re.sub(r"(?s)<reasoning\s*>.*?(?:</reasoning\s*>|$)", "", text)
+    """The answer without any thinking — for deciding what to *act* on.
+
+    Shares iter_tags' unclosed-tag rule, so a missing `</reasoning>` no longer
+    erases the entire answer along with the action block in it.
+    """
+    return _strip_kind(normalize_control_tokens(text), "reasoning")
+
+
+def reasoning_text(text: str) -> str:
+    """Only the thinking — used to tell a stranded action block apart from none."""
+    text = normalize_control_tokens(text)
+    return "\n".join(body for kind, _l, body, _s, _e in iter_tags(text)
+                     if kind == "reasoning")
 
 
 def split_think(raw: str):
-    """Return (reasoning, answer) — Qwen emits <think> blocks we keep collapsed."""
-    think = "\n".join(m.strip() for m in re.findall(r"<think>(.*?)</think>", raw, flags=re.S))
-    body = re.sub(r"(?s)<think>.*?</think>\s*", "", raw)
-    if "<think>" in body and "</think>" not in body:      # still streaming a block
-        think = (think + "\n" + body.split("<think>", 1)[1]).strip()
-        body = body.split("<think>", 1)[0]
-    return think.strip(), body.strip()
+    """Return (reasoning, answer).
+
+    <think> is now rewritten to <reasoning> by normalize_control_tokens, so
+    split_blocks renders it through the ordinary tag path and this returns no
+    separate reasoning. Kept because callers want the answer without thinking.
+    """
+    return "", strip_reasoning(raw).strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -1551,13 +1716,11 @@ class Bubble(QWidget):
 
     def set_text(self, raw: str):
         self.raw = raw
-        # <think> output is folded into the same ReasoningPanel as an explicit
-        # <reasoning> tag, so there is one place reasoning ever appears.
-        reasoning, answer = split_think(raw)
-        blocks = split_blocks(answer) if answer else []
-        if reasoning:
-            # Models that emit <think> get the same panel as an explicit tag.
-            blocks = [("reasoning", reasoning)] + blocks
+        # <think> and <|…THINKING…|> are rewritten to <reasoning> on the way in,
+        # so thinking reaches the same panel as an explicit tag by the same
+        # path — and sits where the model put it rather than always on top.
+        blocks = split_blocks(raw) if raw.strip() else []
+        answer = strip_reasoning(raw).strip()
         if not blocks:
             if self._rendered != []:
                 self._clear_body()
@@ -4581,9 +4744,9 @@ class CriGent(QMainWindow):
             # while reasoning must never execute — with Auto-run on, matching
             # against the full buffer would run it.
             acted = strip_reasoning(text)
-            command = extract_block(acted, "run") if self.tools_check.isChecked() else None
-            query = extract_block(acted, "search") if self.web_check.isChecked() else None
-            url = extract_block(acted, "fetch") if self.web_check.isChecked() else None
+            command = extract_action(acted, "run") if self.tools_check.isChecked() else None
+            query = extract_action(acted, "search") if self.web_check.isChecked() else None
+            url = extract_action(acted, "fetch") if self.web_check.isChecked() else None
 
             if command and command.strip():
                 self.tool_round += 1
@@ -4594,12 +4757,42 @@ class CriGent(QMainWindow):
             elif url and url.strip():
                 self.tool_round += 1
                 self._start_fetch(chat_id, url.strip())
-            elif self.skills_check.isChecked():
-                body = extract_block(acted, "skill")
+            else:
+                body = (extract_action(acted, "skill")
+                        if self.skills_check.isChecked() else None)
                 parsed = parse_skill_block(body) if body else None
                 if parsed:
                     self.tool_round += 1
                     self._offer_skill(chat_id, *parsed)
+                else:
+                    self._nudge_if_stranded(chat_id, text)
+
+    def _nudge_if_stranded(self, chat_id: str, text: str):
+        """Rescue a turn whose only action block was left inside the thinking.
+
+        Nothing inside <reasoning> is ever executed — a command the model merely
+        considered must not run. But the model does not know its block was
+        ignored: it stops and waits for output that will never arrive, and the
+        conversation is stuck until the user notices. Telling it what happened
+        costs one round and it re-sends the block properly.
+        """
+        think = reasoning_text(text)
+        if not think.strip():
+            return
+        for tag, on in (("run", self.tools_check.isChecked()),
+                        ("search", self.web_check.isChecked()),
+                        ("fetch", self.web_check.isChecked()),
+                        ("skill", self.skills_check.isChecked())):
+            body = extract_action(think, tag) if on else None
+            if body and body.strip():
+                self.tool_round += 1
+                self._continue(chat_id, (
+                    f"[CriGent] Your `{tag}` block was inside your reasoning, so it was "
+                    f"not carried out — nothing inside <reasoning> is ever executed, and "
+                    f"you will never receive output for it. Close the reasoning tag first, "
+                    f"then put the block on its own at the very end of your reply:\n\n"
+                    f"```{tag}\n{body.strip().splitlines()[0]}\n```"))
+                return
 
     def _on_failed(self, chat_id: str, err: str):
         gen = self.gens.get(chat_id)

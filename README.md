@@ -111,19 +111,37 @@ whenever you like, and delete a group or the lot.
 Grab `CriGent.exe` from the [latest release](../../releases/latest) and run it.
 It is a single portable file — no installer, no admin rights.
 
-The exe is Authenticode signed and timestamped, which is what gets it past
-Windows 11's [Smart App Control](https://support.microsoft.com/en-us/topic/what-is-smart-app-control-285ea03d-fa88-4d56-882e-6698afdb7003) —
-that blocks unsigned programs it has not seen before.
-
-The certificate is **self-signed**, so Windows still shows an *unknown
-publisher* warning the first time you run it. The signature tells you the file
-has not been altered since it was built; it does not vouch for who built it.
-If you want certainty that you have the file published here, check it against
-the SHA-256 printed in the release notes:
+The exe is Authenticode signed and timestamped. The certificate is
+**self-signed**, so the signature tells you the file has not been altered since
+it was built — it does not vouch for who built it, and Windows still shows an
+*unknown publisher* warning. To be certain you have the file published here,
+check it against the SHA-256 in the release notes:
 
 ```powershell
 Get-FileHash .\CriGent.exe -Algorithm SHA256
 ```
+
+### If Windows refuses to run it
+
+On Windows 11 with
+[Smart App Control](https://support.microsoft.com/en-us/topic/what-is-smart-app-control-285ea03d-fa88-4d56-882e-6698afdb7003)
+switched on you may get *"An Application Control policy has blocked this file"*.
+
+Smart App Control allows a program either because it recognises the file
+itself, or because it is signed by a publisher it already trusts. A self-signed
+certificate is not one of those, so **signing does not get CriGent past it** —
+each new release is an unfamiliar file and starts out blocked. This was tested
+directly: two builds signed with the same certificate, one allowed and one
+blocked, the difference being only which file Windows had seen before.
+
+Getting a certificate from a trusted CA would fix it properly. Until then:
+
+- **Run from source** (below) — Python is not subject to this.
+- **Wait.** Smart App Control decisions are made per file and can change as
+  Microsoft sees more of it.
+- **Turn Smart App Control off** in Windows Security → App & browser control.
+  Consider this carefully: it protects against genuinely unknown software, and
+  once off it cannot be switched back on without reinstalling Windows.
 
 ## First run
 
@@ -210,9 +228,10 @@ pip install pyinstaller
 python -m PyInstaller CriGent.spec --noconfirm
 ```
 
-Sign it, so Smart App Control will let it run. Create the certificate once,
-then sign after every build — an unsigned build is blocked outright on Windows
-11 machines that have Smart App Control switched on:
+Sign it. This does not satisfy Smart App Control — a self-signed certificate is
+not a publisher Windows trusts — but it makes the download tamper-evident and
+means the build is ready if a CA-issued certificate is used later. Create the
+certificate once, then sign after every build:
 
 ```powershell
 # once
