@@ -50,7 +50,7 @@ APP_TAGLINE = "A local AI agent — your models, your machine."
 # Shown on the About page and stamped into every logged error, so a report can
 # be tied to a build. Bump this in the same commit as the release tag — a
 # version the app cannot tell you is a version you cannot check.
-APP_VERSION = "1.5.4"
+APP_VERSION = "1.5.5"
 DEV_NAME = "Abdulaziz Al Jumaia"
 DEV_SITE = "https://crimsonlingua.com"
 DEV_LINKEDIN = "https://sa.linkedin.com/in/abdulaziz-al-jumaia"
@@ -627,6 +627,30 @@ CONTEXT_SIZES = [
 
 # A reply cut short is continued rather than left hanging, but not forever.
 MAX_CONTINUES = 4
+
+# Compaction. When the conversation approaches the context window, the older
+# part is replaced — for the model only — by a summary, and work carries on
+# against that. Raising the window just delays the wall; this removes it.
+COMPACT_AT = 0.72        # fraction of the window that triggers a compaction
+COMPACT_KEEP = 4         # most recent messages always sent verbatim
+COMPACT_MIN = 6          # never compact a conversation shorter than this
+
+COMPACT_PROMPT = (
+    "Summarise the conversation above so that you can carry on working from the "
+    "summary alone, with the original messages gone.\n\n"
+    "This is a handover to yourself, not a description for a reader. Write down "
+    "what you would be unable to continue without:\n\n"
+    "- **The goal** — what the user actually asked for, in their terms.\n"
+    "- **What has been done** — steps taken and commands run, with their "
+    "outcomes. Say which worked and which failed.\n"
+    "- **What was found** — file paths, function and variable names, values, "
+    "error messages, exact strings. Keep these verbatim; they cannot be "
+    "reconstructed from a paraphrase.\n"
+    "- **Decisions and constraints** — anything settled, ruled out, or that the "
+    "user corrected you on.\n"
+    "- **What is left** — the next step, and any task not finished.\n\n"
+    "Be specific and dense. A vague summary loses the work. Do not add "
+    "pleasantries, and do not use the reply tags — plain markdown only.")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
 
@@ -1406,6 +1430,23 @@ class GpuWorker(QThread):
             return {"error": str(exc)}
 
 
+def loaded_context(model: str):
+    """The context window Ollama actually loaded a model with, or None.
+
+    The declared capability and the effective window differ, often wildly — a
+    model built for 262k routinely runs at 8192 because that is what its
+    Modelfile sets. Only the running instance knows, so ask it.
+    """
+    try:
+        resp = requests.get(f"http://{HOST}/api/ps", timeout=5)
+        for m in resp.json().get("models", []):
+            if m.get("name") == model or m.get("model") == model:
+                return int(m.get("context_length") or 0) or None
+    except Exception:                                              # noqa: BLE001
+        return None
+    return None
+
+
 def is_parser_error(detail: str) -> bool:
     """Ollama runs a grammar parser over a thinking/tool model's output. Some
     fine-tunes drift from the format their base model declares, and the parse
@@ -1619,6 +1660,65 @@ class ChatWorker(QThread):
             return "error", "Cannot reach Ollama on 127.0.0.1:11434."
         except Exception as exc:                                  # noqa: BLE001
             return "error", str(exc)
+
+
+class CompactWorker(QThread):
+    """Ask the model to summarise the older part of a conversation.
+
+    Runs as its own request rather than in the chat stream: nothing of it is
+    shown as a reply, and a failure must leave the conversation exactly as it
+    was rather than half-replacing it.
+    """
+
+    done = pyqtSignal(str, int)          # summary, messages covered
+    failed = pyqtSignal(str)
+
+    def __init__(self, messages: list, upto: int, model: str,
+                 num_gpu=None, num_ctx=None):
+        super().__init__()
+        self.messages = messages
+        self.upto = upto
+        self.model = model
+        self.num_gpu = num_gpu
+        self.num_ctx = num_ctx
+
+    def run(self):
+        body = {
+            "model": self.model,
+            "messages": self.messages + [{"role": "user", "content": COMPACT_PROMPT}],
+            "stream": False,
+            "think": False,          # the summary is wanted, not the reasoning
+        }
+        opts = {}
+        if self.num_gpu is not None:
+            opts["num_gpu"] = self.num_gpu
+        if self.num_ctx is not None:
+            opts["num_ctx"] = self.num_ctx
+        if opts:
+            body["options"] = opts
+        try:
+            resp = requests.post(CHAT_URL, json=body, timeout=(10, 600))
+            if resp.status_code >= 400:
+                try:
+                    detail = resp.json().get("error") or resp.text[:300]
+                except Exception:                                  # noqa: BLE001
+                    detail = resp.text[:300]
+                # think=false is rejected outright by some builds; without it
+                # the summary still works, it just costs reasoning tokens.
+                body.pop("think", None)
+                resp = requests.post(CHAT_URL, json=body, timeout=(10, 600))
+                if resp.status_code >= 400:
+                    self.failed.emit(str(detail))
+                    return
+            data = resp.json()
+            text = strip_reasoning(
+                (data.get("message") or {}).get("content", "")).strip()
+            if not text:
+                self.failed.emit("the model returned an empty summary")
+                return
+            self.done.emit(text, self.upto)
+        except Exception as exc:                                   # noqa: BLE001
+            self.failed.emit(str(exc))
 
 
 class CommandWorker(QThread):
@@ -3015,6 +3115,47 @@ class SetupDialog(QDialog):
         super().closeEvent(ev)
 
 
+class CompactCard(QFrame):
+    """Marks the point where the conversation was compacted, and shows what the
+    model kept. Collapsed by default — it is reassurance, not reading."""
+
+    def __init__(self, summary: str, count: int, mono: str):
+        super().__init__()
+        self.setObjectName("compactCard")
+        self._open = False
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 10, 14, 12)
+        v.setSpacing(8)
+
+        self.toggle = QPushButton(
+            f"▸  Conversation compacted — {count} earlier "
+            f"message{'s' if count != 1 else ''} replaced by a summary")
+        self.toggle.setObjectName("compactToggle")
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.setToolTip("The messages above are still here and still "
+                               "saved — this is only what the model now reads "
+                               "in their place.")
+        self.toggle.clicked.connect(self._toggle)
+        v.addWidget(self.toggle)
+        self._label = self.toggle.text()[3:]
+
+        self.body = QPlainTextEdit(summary)
+        self.body.setObjectName("toolOutput")
+        self.body.setReadOnly(True)
+        font = mono_font(mono, CODE_PX_SM)
+        self.body.setFont(font)
+        self.body.setFrameShape(QFrame.Shape.NoFrame)
+        lines = max(1, len(summary.splitlines()))
+        self.body.setFixedHeight(min(320, lines * QFontMetrics(font).lineSpacing() + 26))
+        self.body.hide()
+        v.addWidget(self.body)
+
+    def _toggle(self):
+        self._open = not self._open
+        self.toggle.setText(("▾  " if self._open else "▸  ") + self._label)
+        self.body.setVisible(self._open)
+
+
 class SkillCard(QFrame):
     """A skill the model proposes to save, held for explicit user approval."""
 
@@ -3179,6 +3320,11 @@ class CriGent(QMainWindow):
         self.bubble = None
         self.gens = {}                 # chat_id -> live generation state
         self.pending_actions = {}      # chat_id -> proposal awaiting approval
+        # chat_id -> {"summary", "upto"}: the older messages, folded into one
+        # summary for the model. The transcript itself is never shortened.
+        self.compactions = {}
+        self._compacting = {}          # chat_id -> True while one is running
+        self._ctx_cache = {}           # model -> window Ollama loaded it with
         self.current_model = ""
         self.tool_round = 0
         self.continue_round = 0
@@ -3578,6 +3724,19 @@ class CriGent(QMainWindow):
             lambda on: self._remember_toggle("skills_enabled", on))
 
         row.addStretch()
+
+        # Compaction is automatic; this is for doing it deliberately before a
+        # long task rather than waiting to hit the window mid-answer.
+        self.compact_btn = QPushButton("Compact")
+        self.compact_btn.setObjectName("ghostSm")
+        self.compact_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.compact_btn.setToolTip(
+            "Replace the older messages with a summary, for the model only. "
+            "The conversation on screen and on disk is untouched. This happens "
+            "on its own as the context fills up.")
+        self.compact_btn.clicked.connect(self._compact_now)
+        row.addWidget(self.compact_btn)
+
         self.tokens_lbl = QLabel("")
         self.tokens_lbl.setObjectName("meta")
         row.addWidget(self.tokens_lbl)
@@ -4793,6 +4952,17 @@ class CriGent(QMainWindow):
         self._save_current_chat()
         self._begin_generation()
 
+    def _compact_now(self):
+        """Manual compaction, from the composer. Useful before a long task
+        rather than waiting to hit the wall mid-answer."""
+        if self._current_gen():
+            self._notice("Wait for the current reply to finish first.")
+            return
+        if not self._compact(self.current_chat_id):
+            self._notice("Nothing new to compact — the conversation is either "
+                         "too short or already summarised up to the last few "
+                         "messages.")
+
     def _have_model(self) -> bool:
         # Without this the request goes out as {"model": ""} and Ollama answers
         # 400 "model is required" — technically accurate, useless to a newcomer
@@ -4858,7 +5028,7 @@ class CriGent(QMainWindow):
         sys_parts.append(self.prompts.get("format", ""))
         sys_parts = [p for p in sys_parts if p.strip()]
 
-        payload = list(gen["messages"])
+        payload = self._payload_for(chat_id, gen["messages"])
         if sys_parts:
             payload = [{"role": "system", "content": "\n\n".join(sys_parts)}] + payload
 
@@ -4950,8 +5120,19 @@ class CriGent(QMainWindow):
         # so there was no answer and no action block either — and look exactly
         # like a model that had simply decided to stop.
         if getattr(worker, "truncated", False) and text:
+            # Compact first where there is history to compact: continuing into
+            # an already-full window just truncates again a few tokens later.
+            if self._compact(chat_id,
+                             then=lambda c=chat_id, t=text:
+                             self._continue_truncated(c, t)):
+                return
             if self._continue_truncated(chat_id, text):
                 return
+
+        # Not yet at the wall, but close enough that the next turn would be.
+        # Compacting now means the user never sees a reply cut short.
+        if self._should_compact(chat_id, prompt_tokens):
+            self._compact(chat_id)
 
         if self.tool_round < MAX_TOOL_ROUNDS:
             # Scan only the answer. A command the model merely thought about
@@ -4980,6 +5161,116 @@ class CriGent(QMainWindow):
                     self._offer_skill(chat_id, *parsed)
                 else:
                     self._nudge_if_stranded(chat_id, text)
+
+    # ----------------------------------------------------------------- #
+    #  Compaction
+    # ----------------------------------------------------------------- #
+
+    def _payload_for(self, chat_id: str, messages: list) -> list:
+        """What the model is actually sent.
+
+        Once a conversation has been compacted, everything before the cut is
+        replaced by its summary — for the model only. `messages` itself is left
+        whole, so the chat on screen and the saved transcript are unaffected:
+        compaction changes what the model reads, never what the user keeps.
+        """
+        state = self.compactions.get(chat_id)
+        if not state or not state.get("summary"):
+            return list(messages)
+        upto = min(int(state.get("upto", 0)), len(messages))
+        if upto <= 0:
+            return list(messages)
+        return [{"role": "system",
+                 "content": "## Earlier in this conversation\n\n"
+                            "The messages before this point were replaced by "
+                            "the summary below to stay within the context "
+                            "window. Treat it as your own record of the work "
+                            "so far and carry on from it.\n\n"
+                            + state["summary"]}] + list(messages[upto:])
+
+    def _context_window(self):
+        """The window in force: whatever was chosen, else what Ollama loaded."""
+        chosen = self._num_ctx()
+        if chosen:
+            return chosen
+        if self._ctx_cache.get("model") != self.current_model:
+            self._ctx_cache = {"model": self.current_model,
+                               "window": loaded_context(self.current_model)}
+        return self._ctx_cache.get("window")
+
+    def _should_compact(self, chat_id: str, prompt_tokens: int) -> bool:
+        gen_msgs = self.messages if chat_id == self.current_chat_id else None
+        msgs = gen_msgs if gen_msgs is not None else []
+        if len(msgs) < COMPACT_MIN:
+            return False
+        state = self.compactions.get(chat_id, {})
+        # Nothing new to fold in since the last one.
+        if len(msgs) - COMPACT_KEEP <= int(state.get("upto", 0)):
+            return False
+        window = self._context_window()
+        if not window or not prompt_tokens:
+            return False
+        return prompt_tokens > COMPACT_AT * window
+
+    def _compact(self, chat_id: str, then=None) -> bool:
+        """Summarise the older messages and carry on from the summary.
+
+        `then` is called once the summary is in place, which is how a turn cut
+        short by the window resumes: compact first, so the retry has room, then
+        continue. Started at most once at a time per chat.
+        """
+        if self._compacting.get(chat_id):
+            return False
+        msgs = self.messages if chat_id == self.current_chat_id else None
+        if msgs is None or len(msgs) < COMPACT_MIN:
+            return False
+        upto = len(msgs) - COMPACT_KEEP
+        if upto <= 0:
+            return False
+        # Nothing has accumulated since the last one, so a second pass would
+        # summarise a summary and cost a model call to learn nothing.
+        if upto <= int(self.compactions.get(chat_id, {}).get("upto", 0)):
+            return False
+
+        # Summarise on top of any previous summary, so nothing is lost across
+        # repeated compactions — the older summary is part of the input.
+        source = self._payload_for(chat_id, msgs[:upto])
+        self._compacting[chat_id] = True
+        self._notice("Compacting the conversation to stay within the context "
+                     "window — the summary replaces the older messages for the "
+                     "model, and everything above stays on screen.")
+        worker = CompactWorker(source, upto, self.current_model,
+                               self._num_gpu(), self._num_ctx())
+        worker.done.connect(
+            lambda s, u, c=chat_id: self._on_compacted(c, s, u, then))
+        worker.failed.connect(lambda e, c=chat_id: self._on_compact_failed(c, e, then))
+        self._compact_worker = self._track(worker)
+        worker.start()
+        return True
+
+    def _on_compacted(self, chat_id: str, summary: str, upto: int, then=None):
+        self._compacting.pop(chat_id, None)
+        self.compactions[chat_id] = {"summary": summary, "upto": upto,
+                                     "at": time.time()}
+        if chat_id == self.current_chat_id:
+            card = CompactCard(summary, upto, self.mono)
+            self.feed.insertWidget(self.feed.count() - 1, card)
+            self._scroll_down()
+        self._save_chat(chat_id, self.messages if chat_id == self.current_chat_id
+                        else [])
+        record_error("Compacted",
+                     f"Conversation compacted: {upto} messages replaced by a "
+                     f"{len(summary)}-character summary.", summary[:1000])
+        if then:
+            then()
+
+    def _on_compact_failed(self, chat_id: str, err: str, then=None):
+        self._compacting.pop(chat_id, None)
+        record_error("Compact failed", err)
+        self._notice(f"Could not compact the conversation: {err}. Carrying on "
+                     f"with the full history.")
+        if then:
+            then()
 
     def _continue_truncated(self, chat_id: str, text: str) -> bool:
         """Ask the model to carry on from where it ran out of room.
@@ -5318,6 +5609,11 @@ class CriGent(QMainWindow):
             "id": chat_id, "title": title, "model": self.current_model,
             "created": created, "updated": time.time(), "messages": messages,
         }
+        # Saved with the chat so reopening it does not silently go back to
+        # sending the full history and hitting the same wall again.
+        state = self.compactions.get(chat_id)
+        if state and state.get("summary"):
+            data["compaction"] = state
         _atomic_write_json(path, data)
         if is_new:
             self._reload_chat_list()      # a row appeared; otherwise nothing moved
@@ -5370,6 +5666,11 @@ class CriGent(QMainWindow):
 
         self.messages = data.get("messages", [])
         self.current_chat_id = data.get("id", chat_id)
+        saved = data.get("compaction")
+        if isinstance(saved, dict) and saved.get("summary"):
+            self.compactions[self.current_chat_id] = saved
+        else:
+            self.compactions.pop(self.current_chat_id, None)
         # self.buffer is owned by the in-flight reply; clearing it here would
         # throw away text that has already streamed in for another chat.
         self.bubble = None
@@ -5897,6 +6198,11 @@ class CriGent(QMainWindow):
         #crashToggle {{ background:transparent; border:none; color:{C['text']};
                         font-size:13px; font-weight:600; text-align:left; padding:0; }}
         #crashToggle:hover {{ color:{C['accent_hi']}; }}
+        #compactCard {{ background:{C['panel']}; border:1px solid {C['line']};
+                        border-left:3px solid {C['accent']}; border-radius:10px; }}
+        #compactToggle {{ background:transparent; border:none; color:{C['accent']};
+                          font-size:12px; font-weight:600; text-align:left;
+                          padding:0; }}
         #crashCount {{ color:{C['red']}; font-size:11px; font-weight:700; }}
         /* Two severities, told apart at a glance: red took the app down,
            amber was reported and survived. */

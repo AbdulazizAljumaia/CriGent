@@ -71,9 +71,25 @@ and the reply simply stops mid-sentence, often mid-thought.
 
 Leave it on **auto** and the model's own setting applies, which is frequently far
 smaller than the model can manage: a model built for 262,000 tokens is commonly
-shipped set to 8,192. If replies keep getting cut short while reading files,
-this is the setting to raise. Bigger costs VRAM, which is why it is a choice
-rather than a raised default.
+shipped set to 8,192. Bigger costs VRAM, which is why it is a choice rather than
+a raised default.
+
+**You do not have to keep raising it, though — see compaction below.**
+
+**5b · Long conversations compact themselves**
+
+Every window fills eventually. Rather than truncating a reply or losing the
+thread, CriGent asks the model to summarise the work so far and carries on from
+that summary — the goal, what was done, what was found, file paths, error
+messages, and what is left.
+
+The summary replaces the older messages **for the model only**. Your
+conversation stays on screen and on disk exactly as it was; nothing is deleted.
+A marker shows where it happened, and opening it shows what was kept.
+
+It runs on its own as the window fills, and again if a reply is ever cut short.
+The **Compact** button beside Send does it on demand — worth doing before a long
+task rather than waiting to hit the wall mid-answer.
 
 **6 · Replies laid out by what they contain**
 
@@ -221,6 +237,7 @@ points CriGent at the existing one.
 | **Err logs** | Errors and crashes inside CriGent, badged apart and grouped by kind and day, each stamped with the version it happened on. Switch recording off, or delete what is there. |
 | **Compute** | Force GPU (CUDA), force CPU, or leave it to Ollama. |
 | **Context** | How much the model holds in mind at once, from the model's own setting up to 128K. A reply that runs out of room is continued automatically rather than left hanging. |
+| **Compaction** | When the conversation approaches the window, the older part is summarised and work carries on from the summary — automatically, or on demand with **Compact**. The transcript you see and the file on disk are never shortened. |
 
 ### ⚠️ About Auto-run
 
