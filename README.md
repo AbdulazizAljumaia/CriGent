@@ -127,18 +127,19 @@ On Windows 11 with
 [Smart App Control](https://support.microsoft.com/en-us/topic/what-is-smart-app-control-285ea03d-fa88-4d56-882e-6698afdb7003)
 switched on you may get *"An Application Control policy has blocked this file"*.
 
-Smart App Control allows a program either because it recognises the file
-itself, or because it is signed by a publisher it already trusts. A self-signed
-certificate is not one of those, so **signing does not get CriGent past it** —
-each new release is an unfamiliar file and starts out blocked. This was tested
-directly: two builds signed with the same certificate, one allowed and one
-blocked, the difference being only which file Windows had seen before.
+The released exe is one Windows allows — checked by running it with the policy
+enforcing. But Smart App Control judges each file individually, and its verdict
+on a file it has not seen is not fixed, so a build you make yourself may be
+blocked.
 
-Getting a certificate from a trusted CA would fix it properly. Until then:
+If that happens, **sign it again**. Each signature produces a different file and
+a fresh decision. The v1.5.1 build was blocked on its first two signatures and
+allowed on the third — identical code, identical certificate. It is worth two or
+three attempts before concluding it cannot work.
+
+Failing that:
 
 - **Run from source** (below) — Python is not subject to this.
-- **Wait.** Smart App Control decisions are made per file and can change as
-  Microsoft sees more of it.
 - **Turn Smart App Control off** in Windows Security → App & browser control.
   Consider this carefully: it protects against genuinely unknown software, and
   once off it cannot be switched back on without reinstalling Windows.
@@ -228,10 +229,10 @@ pip install pyinstaller
 python -m PyInstaller CriGent.spec --noconfirm
 ```
 
-Sign it. This does not satisfy Smart App Control — a self-signed certificate is
-not a publisher Windows trusts — but it makes the download tamper-evident and
-means the build is ready if a CA-issued certificate is used later. Create the
-certificate once, then sign after every build:
+Sign it. This makes the download tamper-evident, and it is also what lets Smart
+App Control accept the build — though not always on the first attempt, so if the
+signed exe will not start, sign it again and retry. Create the certificate once,
+then sign after every build:
 
 ```powershell
 # once
