@@ -50,7 +50,7 @@ APP_TAGLINE = "A local AI agent — your models, your machine."
 # Shown on the About page and stamped into every logged error, so a report can
 # be tied to a build. Bump this in the same commit as the release tag — a
 # version the app cannot tell you is a version you cannot check.
-APP_VERSION = "1.5.5"
+APP_VERSION = "1.6.0"
 DEV_NAME = "Abdulaziz Al Jumaia"
 DEV_SITE = "https://crimsonlingua.com"
 DEV_LINKEDIN = "https://sa.linkedin.com/in/abdulaziz-al-jumaia"
@@ -634,10 +634,121 @@ MAX_CONTINUES = 4
 COMPACT_AT = 0.72        # fraction of the window that triggers a compaction
 COMPACT_KEEP = 4         # most recent messages always sent verbatim
 COMPACT_MIN = 6          # never compact a conversation shorter than this
+FACTS_MAX = 80           # verbatim facts pinned into every later prompt
+DIGEST_MAX = 9000        # characters of summary text before the oldest is dropped
+RECALL_HITS = 6          # archived messages returned per recall
+
+# Three things stop a summary losing work, and they are deliberately separate:
+#
+#  1. Facts are pulled out of the transcript by pattern, never by the model, so
+#     paths, commands, exit codes and error strings are carried forward exactly
+#     as they were written. Nothing paraphrases them, so nothing can blur them.
+#  2. Each compaction summarises only the messages new since the last one, and
+#     the result is appended. A summary is never fed back in to be summarised
+#     again, which is what makes repeated compaction degrade.
+#  3. Anything not in either can still be fetched: the whole transcript stays on
+#     disk and ```recall searches it. Compaction moves messages out of the
+#     prompt; it never puts them out of reach.
+
+FACT_PATTERNS = (
+    # A command that was actually run, and what it returned.
+    re.compile(r"^\$ .+$", re.M),
+    re.compile(r"^exit code: -?\d+$", re.M),
+    # Anything that reads as a failure — these are the lines a summary is most
+    # likely to soften into "an error occurred".
+    re.compile(r"^.*(?:Traceback \(most recent call last\)|"
+               r"[A-Za-z_]*(?:Error|Exception)[:(]|errno[ =-]|"
+               r"\bexit code [1-9]|\bFAILED\b|\bfatal:).*$", re.M),
+    # Absolute Windows and POSIX paths, and bare source filenames.
+    re.compile(r"[A-Za-z]:\\[^\s\"'<>|,;]+"),
+    re.compile(r"(?<![\w/])/(?:usr|etc|opt|home|var|tmp)/[^\s\"'<>|,;]+"),
+    re.compile(r"\b[\w.-]+\.(?:py|js|ts|json|toml|yaml|yml|cfg|ini|sql|md|"
+               r"ps1|bat|sh|c|h|cpp|cs|java|rs|go)\b"),
+    re.compile(r"https?://[^\s\"'<>)\]]+"),
+    # line 214 / :214: — a number that locates something.
+    re.compile(r"\bline \d+\b"),
+)
+
+
+def extract_facts(messages: list, limit: int = FACTS_MAX) -> list:
+    """Verbatim strings worth carrying past a compaction, newest first.
+
+    Mechanical on purpose. The model writes the narrative; this keeps the parts
+    that must survive character-for-character, because a path or an errno that
+    has been reworded is worse than useless — it looks authoritative and is
+    wrong.
+    """
+    seen, facts = set(), []
+    for msg in reversed(messages):
+        body = msg.get("content", "") or ""
+        for pat in FACT_PATTERNS:
+            for hit in pat.findall(body):
+                hit = (hit if isinstance(hit, str) else hit[0]).strip()
+                hit = hit.rstrip(".,;:)")
+                if len(hit) < 4 or len(hit) > 300:
+                    continue
+                key = hit.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                facts.append(hit)
+                if len(facts) >= limit:
+                    return facts
+    return facts
+
+RECALL_SYSTEM_PROMPT = (
+    "## Reading the earlier messages\n\n"
+    "Part of this conversation was summarised to save room, but **nothing was "
+    "deleted** — every original message is still stored and you can read any of "
+    "them back.\n\n"
+    "If you need something the summary does not cover — the exact wording of an "
+    "earlier message, a full command output, what a file contained — ask for it:\n\n"
+    "```recall\nprinter_driver\n```\n\n"
+    "Then stop. You are given the matching messages verbatim.\n\n"
+    "- One search term or short phrase per block. Matching is plain substring, "
+    "case-insensitive; a distinctive word works better than a sentence.\n"
+    "- Use it whenever you are about to say you no longer have something, or "
+    "are tempted to guess at a detail you saw earlier. Guessing is the one thing "
+    "you must not do — look it up instead.\n"
+    "- Send the block in the same reply. Writing that you will look something "
+    "up is not looking it up: a turn that only plans to recall ends with "
+    "nothing fetched and nothing to show.")
+
+
+def search_archive(messages: list, upto: int, query: str, limit: int = RECALL_HITS):
+    """Find archived messages containing `query`, newest first.
+
+    Searches only what compaction removed from the prompt — the rest is already
+    in front of the model.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    hits = []
+    for i in range(min(upto, len(messages)) - 1, -1, -1):
+        body = messages[i].get("content", "") or ""
+        if q in body.lower():
+            hits.append((i, messages[i].get("role", "?"), body))
+            if len(hits) >= limit:
+                break
+    return hits
+
+
+def format_recall(hits: list, query: str, total: int) -> str:
+    if not hits:
+        return (f'No earlier message contains "{query}". Try a different word — '
+                f"matching is plain substring, not meaning.")
+    out = [f'{len(hits)} earlier message(s) containing "{query}", newest first. '
+           f"These are the originals, unedited:"]
+    for idx, role, body in hits:
+        excerpt = body if len(body) <= 2000 else body[:2000] + "\n…[truncated]"
+        out.append(f"\n--- message {idx + 1} of {total} · {role} ---\n{excerpt}")
+    return "\n".join(out)
+
 
 COMPACT_PROMPT = (
     "Summarise the conversation above so that you can carry on working from the "
-    "summary alone, with the original messages gone.\n\n"
+    "summary, without the original messages in front of you.\n\n"
     "This is a handover to yourself, not a description for a reader. Write down "
     "what you would be unable to continue without:\n\n"
     "- **The goal** — what the user actually asked for, in their terms.\n"
@@ -903,10 +1014,10 @@ CODE_FENCE_RE = re.compile(r"```(\w*)\n?(.*?)(?:```|$)", re.S)
 # gets its own container instead of one undifferentiated wall of prose. Matched
 # unclosed too, so a container appears as soon as the tag opens while streaming.
 TAG_NAMES = ("reasoning", "instructions", "math", "code", "text", "tasks")
-ACTION_NAMES = ("run", "search", "fetch", "skill")
+ACTION_NAMES = ("run", "search", "fetch", "skill", "recall")
 
 TAG_OPEN_RE = re.compile(
-    r"<(reasoning|instructions|math|code|text|tasks|run|search|fetch|skill)"
+    r"<(reasoning|instructions|math|code|text|tasks|run|search|fetch|skill|recall)"
     r"(?:\s+lang=[\"']?([\w+#.-]+)[\"']?)?\s*>", re.I)
 # What an *unclosed* tag gives way to: the next tag that opens. Content tags
 # only — deliberately NOT the action tags. If the model never closed
@@ -3272,7 +3383,8 @@ class WebCard(QFrame):
         v.setContentsMargins(16, 12, 16, 14)
         v.setSpacing(8)
 
-        label = "Web search" if kind == "search" else "Reading page"
+        label = {"search": "Web search", "fetch": "Reading page",
+                 "recall": "Searching earlier messages"}.get(kind, kind.title())
         head_row = QHBoxLayout()
         header = QLabel(label)
         header.setObjectName("webHeader")
@@ -5026,11 +5138,15 @@ class CriGent(QMainWindow):
         # Layout applies to every reply, so it is not behind a toggle. An empty
         # box is how you turn it off, and the filter below honours that.
         sys_parts.append(self.prompts.get("format", ""))
+        # Only once something has actually been archived — before that there is
+        # nothing to recall and the instruction would just be noise.
+        if int((self.compactions.get(chat_id) or {}).get("upto", 0)) > 0:
+            sys_parts.append(RECALL_SYSTEM_PROMPT)
         sys_parts = [p for p in sys_parts if p.strip()]
 
-        payload = self._payload_for(chat_id, gen["messages"])
-        if sys_parts:
-            payload = [{"role": "system", "content": "\n\n".join(sys_parts)}] + payload
+        # Builds the single system message itself — see _payload_for on why a
+        # second one is not an option.
+        payload = self._payload_for(chat_id, gen["messages"], sys_parts)
 
         # Deliberately does not touch other chats' workers. Replies run in
         # parallel, one per conversation.
@@ -5143,7 +5259,17 @@ class CriGent(QMainWindow):
             query = extract_action(acted, "search") if self.web_check.isChecked() else None
             url = extract_action(acted, "fetch") if self.web_check.isChecked() else None
 
-            if command and command.strip():
+            # Reads this conversation's own archived messages — no filesystem,
+            # no network, nothing to approve. Checked first so a model looking
+            # something up is never mistaken for one proposing a command.
+            memo = (extract_action(acted, "recall")
+                    if int((self.compactions.get(chat_id) or {}).get("upto", 0)) > 0
+                    else None)
+
+            if memo and memo.strip():
+                self.tool_round += 1
+                self._start_recall(chat_id, memo.strip())
+            elif command and command.strip():
                 self.tool_round += 1
                 self._offer_tool(chat_id, command.strip())
             elif query and query.strip():
@@ -5166,27 +5292,86 @@ class CriGent(QMainWindow):
     #  Compaction
     # ----------------------------------------------------------------- #
 
-    def _payload_for(self, chat_id: str, messages: list) -> list:
+    @staticmethod
+    def _migrate(state: dict) -> dict:
+        """Accept the single-summary shape written before segments existed."""
+        if state and "summary" in state and "segments" not in state:
+            return {"segments": [{"from": 0, "upto": int(state.get("upto", 0)),
+                                  "summary": state["summary"],
+                                  "at": state.get("at", 0)}],
+                    "facts": state.get("facts", []),
+                    "upto": int(state.get("upto", 0))}
+        return state or {}
+
+    def _digest(self, state: dict) -> str:
+        """The carried-forward record: pinned facts, then each summary in order.
+
+        Facts come first and are never abridged. If the summaries have to be
+        trimmed to fit, the oldest narrative goes and the facts stay — a lost
+        sentence of context is recoverable by reading on; a lost file path or
+        errno is not.
+        """
+        parts = []
+        facts = state.get("facts") or []
+        if facts:
+            parts.append(
+                "### Established facts — exact, do not paraphrase\n\n"
+                + "\n".join(f"- `{f}`" for f in facts))
+
+        segments = list(state.get("segments") or [])
+        bodies, total = [], 0
+        for seg in reversed(segments):            # newest first while trimming
+            body = (seg.get("summary") or "").strip()
+            if not body:
+                continue
+            if total + len(body) > DIGEST_MAX and bodies:
+                bodies.append(
+                    "[Earlier summaries were dropped to save room. The facts "
+                    "above still hold, and the original messages can be read "
+                    "back with a ```recall block.]")
+                break
+            bodies.append(body)
+            total += len(body)
+        if bodies:
+            parts.append("### What has happened so far\n\n"
+                         + "\n\n".join(reversed(bodies)))
+        return "\n\n".join(parts)
+
+    def _payload_for(self, chat_id: str, messages: list, sys_parts=None) -> list:
         """What the model is actually sent.
 
-        Once a conversation has been compacted, everything before the cut is
-        replaced by its summary — for the model only. `messages` itself is left
+        Once a conversation has been compacted, the messages before the cut are
+        replaced — for the model only — by the digest. `messages` itself is left
         whole, so the chat on screen and the saved transcript are unaffected:
-        compaction changes what the model reads, never what the user keeps.
+        compaction changes what the model reads, never what the user keeps, and
+        never what it can ask to read again.
+
+        **Exactly one system message, and it comes first.** The digest is folded
+        into it rather than added as a second, because a chat template that
+        cannot express two rejects the whole request — Ollama answers 400
+        "Unable to generate parser for this template", with no reply at all.
+        Tested against the local model: a second system message fails whether it
+        sits next to the first or later in the list.
         """
-        state = self.compactions.get(chat_id)
-        if not state or not state.get("summary"):
-            return list(messages)
+        parts = [p for p in (sys_parts or []) if p and p.strip()]
+        state = self._migrate(self.compactions.get(chat_id) or {})
         upto = min(int(state.get("upto", 0)), len(messages))
-        if upto <= 0:
-            return list(messages)
-        return [{"role": "system",
-                 "content": "## Earlier in this conversation\n\n"
-                            "The messages before this point were replaced by "
-                            "the summary below to stay within the context "
-                            "window. Treat it as your own record of the work "
-                            "so far and carry on from it.\n\n"
-                            + state["summary"]}] + list(messages[upto:])
+        digest = self._digest(state) if upto > 0 else ""
+        if upto > 0 and digest:
+            parts.append(
+                f"## Earlier in this conversation\n\n"
+                f"The first {upto} messages were replaced by this record to "
+                f"stay within the context window. Treat it as your own notes "
+                f"and carry on from it.\n\n"
+                f"They were **not deleted** — every one is still stored. If you "
+                f"need something this record does not cover, read it back with "
+                f"a ```recall block rather than guessing.\n\n" + digest)
+            tail = list(messages[upto:])
+        else:
+            tail = list(messages)
+        if parts:
+            return [{"role": "system", "content": "\n\n".join(parts)}] + tail
+        return tail
 
     def _context_window(self):
         """The window in force: whatever was chosen, else what Ollama loaded."""
@@ -5227,14 +5412,25 @@ class CriGent(QMainWindow):
         upto = len(msgs) - COMPACT_KEEP
         if upto <= 0:
             return False
+        state = self._migrate(self.compactions.get(chat_id) or {})
+        frm = int(state.get("upto", 0))
         # Nothing has accumulated since the last one, so a second pass would
-        # summarise a summary and cost a model call to learn nothing.
-        if upto <= int(self.compactions.get(chat_id, {}).get("upto", 0)):
+        # cost a model call to learn nothing.
+        if upto <= frm:
             return False
 
-        # Summarise on top of any previous summary, so nothing is lost across
-        # repeated compactions — the older summary is part of the input.
-        source = self._payload_for(chat_id, msgs[:upto])
+        # Only the messages new since the last compaction are summarised, and
+        # the result is appended. Re-summarising an existing summary is what
+        # makes repeated compaction drift, so it is never done — the earlier
+        # digest goes in as read-only context, not as material to rewrite.
+        source = list(msgs[frm:upto])
+        digest = self._digest(state)
+        if digest:
+            source = [{"role": "system",
+                       "content": "Your notes from earlier in this conversation, "
+                                  "for context. Do NOT re-summarise these; "
+                                  "summarise only the messages that follow.\n\n"
+                                  + digest}] + source
         self._compacting[chat_id] = True
         self._notice("Compacting the conversation to stay within the context "
                      "window — the summary replaces the older messages for the "
@@ -5250,10 +5446,23 @@ class CriGent(QMainWindow):
 
     def _on_compacted(self, chat_id: str, summary: str, upto: int, then=None):
         self._compacting.pop(chat_id, None)
-        self.compactions[chat_id] = {"summary": summary, "upto": upto,
-                                     "at": time.time()}
+        msgs = self.messages if chat_id == self.current_chat_id else []
+        state = self._migrate(self.compactions.get(chat_id) or {})
+        frm = int(state.get("upto", 0))
+        segments = list(state.get("segments") or [])
+        segments.append({"from": frm, "upto": upto, "summary": summary,
+                         "at": time.time()})
+        # Facts are re-derived from the whole archive every time rather than
+        # accumulated, so a value corrected later replaces the stale one instead
+        # of both being carried forward as if equally true.
+        self.compactions[chat_id] = {
+            "segments": segments,
+            "facts": extract_facts(msgs[:upto]),
+            "upto": upto,
+        }
         if chat_id == self.current_chat_id:
-            card = CompactCard(summary, upto, self.mono)
+            card = CompactCard(self._digest(self.compactions[chat_id]),
+                               upto, self.mono)
             self.feed.insertWidget(self.feed.count() - 1, card)
             self._scroll_down()
         self._save_chat(chat_id, self.messages if chat_id == self.current_chat_id
@@ -5271,6 +5480,26 @@ class CriGent(QMainWindow):
                      f"with the full history.")
         if then:
             then()
+
+    def _start_recall(self, chat_id: str, query: str):
+        """Read archived messages back verbatim.
+
+        Runs inline rather than on a worker: it is a substring scan over a list
+        already in memory, and a thread would cost more than the search.
+        """
+        card = WebCard("recall", query, self.mono)
+        if chat_id == self.current_chat_id:
+            self.feed.insertWidget(self.feed.count() - 1, card)
+            self._scroll_down()
+        msgs = self.messages if chat_id == self.current_chat_id else []
+        upto = int((self.compactions.get(chat_id) or {}).get("upto", 0))
+        hits = search_archive(msgs, upto, query)
+        body = format_recall(hits, query, len(msgs))
+        card.show_result(
+            f"{len(hits)} of the first {upto} messages matched."
+            if hits else f'Nothing in the archived messages matches "{query}".',
+            ok=bool(hits))
+        self._continue(chat_id, f"[Earlier messages]\n{body}")
 
     def _continue_truncated(self, chat_id: str, text: str) -> bool:
         """Ask the model to carry on from where it ran out of room.
@@ -5612,7 +5841,7 @@ class CriGent(QMainWindow):
         # Saved with the chat so reopening it does not silently go back to
         # sending the full history and hitting the same wall again.
         state = self.compactions.get(chat_id)
-        if state and state.get("summary"):
+        if state and (state.get("segments") or state.get("summary")):
             data["compaction"] = state
         _atomic_write_json(path, data)
         if is_new:
@@ -5667,8 +5896,8 @@ class CriGent(QMainWindow):
         self.messages = data.get("messages", [])
         self.current_chat_id = data.get("id", chat_id)
         saved = data.get("compaction")
-        if isinstance(saved, dict) and saved.get("summary"):
-            self.compactions[self.current_chat_id] = saved
+        if isinstance(saved, dict) and (saved.get("segments") or saved.get("summary")):
+            self.compactions[self.current_chat_id] = self._migrate(saved)
         else:
             self.compactions.pop(self.current_chat_id, None)
         # self.buffer is owned by the in-flight reply; clearing it here would

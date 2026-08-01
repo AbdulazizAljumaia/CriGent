@@ -76,16 +76,33 @@ a raised default.
 
 **You do not have to keep raising it, though — see compaction below.**
 
-**5b · Long conversations compact themselves**
+**5b · Long conversations compact themselves, without losing the work**
 
 Every window fills eventually. Rather than truncating a reply or losing the
-thread, CriGent asks the model to summarise the work so far and carries on from
-that summary — the goal, what was done, what was found, file paths, error
-messages, and what is left.
+thread, CriGent replaces the older messages — **for the model only** — with a
+record of what matters. Three things keep that from costing you anything:
 
-The summary replaces the older messages **for the model only**. Your
-conversation stays on screen and on disk exactly as it was; nothing is deleted.
-A marker shows where it happened, and opening it shows what was kept.
+**Facts are copied, not summarised.** File paths, commands and their exit codes,
+error classes, line numbers and URLs are pulled out of the transcript by pattern
+rather than by the model, so they carry forward character-for-character. Nothing
+paraphrases them, so nothing can blur them. A reworded errno is worse than a
+missing one — it looks authoritative and is wrong.
+
+**A summary is never summarised again.** Each compaction covers only what is new
+since the last one and is appended. The earlier record goes in as read-only
+context, never as material to rewrite, so the tenth compaction is as sharp as
+the first.
+
+**Nothing is out of reach.** The full transcript stays on disk, and the model can
+read any of it back with a `recall` search when the record does not cover
+something. Asked for a detail deliberately left out of its notes, the local model
+looked it up rather than inventing it in six runs out of six.
+
+![Compaction](docs/11-compaction.png)
+
+Your conversation stays on screen and on disk exactly as it was; nothing is ever
+deleted. A marker shows where it happened, and opening it shows precisely what
+the model is working from.
 
 It runs on its own as the window fills, and again if a reply is ever cut short.
 The **Compact** button beside Send does it on demand — worth doing before a long
@@ -237,7 +254,8 @@ points CriGent at the existing one.
 | **Err logs** | Errors and crashes inside CriGent, badged apart and grouped by kind and day, each stamped with the version it happened on. Switch recording off, or delete what is there. |
 | **Compute** | Force GPU (CUDA), force CPU, or leave it to Ollama. |
 | **Context** | How much the model holds in mind at once, from the model's own setting up to 128K. A reply that runs out of room is continued automatically rather than left hanging. |
-| **Compaction** | When the conversation approaches the window, the older part is summarised and work carries on from the summary — automatically, or on demand with **Compact**. The transcript you see and the file on disk are never shortened. |
+| **Compaction** | When the conversation approaches the window, the older part is replaced — for the model — by a verbatim facts ledger plus a summary, and work carries on from that. Automatic, or on demand with **Compact**. The transcript you see and the file on disk are never shortened. |
+| **Recall** | Anything compaction moved out of the prompt can be read back verbatim: the model searches the stored transcript rather than guessing at a detail it no longer has in front of it. |
 
 ### ⚠️ About Auto-run
 
