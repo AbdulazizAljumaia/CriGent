@@ -30,12 +30,12 @@ try:
     from bs4 import BeautifulSoup
 except ImportError:                                                # noqa: BLE001
     BeautifulSoup = None
-from PyQt6.QtCore import (QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRect,
+from PyQt6.QtCore import (QEasingCurve, QEvent, QPoint, QPointF, QPropertyAnimation, QRect,
                           QRectF, QSize, Qt, QThread, QTimer, QUrl, pyqtProperty,
                           pyqtSignal)
 from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase,
                          QFontMetrics, QIcon, QLinearGradient, QPainter,
-                         QPainterPath, QPen, QPixmap, QTextCursor)
+                         QPainterPath, QPen, QPixmap, QTextCursor, QTextDocument)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
                              QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
                              QHBoxLayout, QInputDialog, QLabel, QLineEdit,
@@ -50,7 +50,7 @@ APP_TAGLINE = "A local AI agent — your models, your machine."
 # Shown on the About page and stamped into every logged error, so a report can
 # be tied to a build. Bump this in the same commit as the release tag — a
 # version the app cannot tell you is a version you cannot check.
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 DEV_NAME = "Abdulaziz Al Jumaia"
 DEV_SITE = "https://crimsonlingua.com"
 DEV_LINKEDIN = "https://sa.linkedin.com/in/abdulaziz-al-jumaia"
@@ -280,7 +280,20 @@ FORMAT_SYSTEM_PROMPT = (
     "<tasks>The checklist for a multi-step job. One task per line, each "
     "starting with ☐ (to do), ✓ (done) or ✗ (cannot be done — say why on the "
     "same line).</tasks>\n"
-    "<text>Ordinary prose. Optional — untagged text is treated as prose.</text>\n\n"
+    "<text>Ordinary prose. Optional — untagged text is treated as prose.</text>\n"
+    "<table>A comparison or a set of records. Each row is a <row>, each cell in "
+    "it a <cell>, and the first row is the column headings.</table>\n\n"
+    "A table is the one tag with tags inside it. Write it like this:\n\n"
+    "<table>\n"
+    "<caption>Cost per run</caption>\n"
+    "<row><cell>Step</cell><cell>Tool</cell><cell>Seconds</cell></row>\n"
+    "<row><cell>Fetch</cell><cell>curl</cell><cell>2.4</cell></row>\n"
+    "<row><cell>Parse</cell><cell>lxml</cell><cell>0.8</cell></row>\n"
+    "</table>\n\n"
+    "Every row has the same number of cells, and <caption> is optional. **Never "
+    "draw a table out of dashes, pipes or box-drawing characters** — they only "
+    "line up in a fixed-width font, and CriGent lays out real columns for you "
+    "from the tags. One cell per <cell>; do not put a whole row in one.\n\n"
     "Put your reasoning in <reasoning> and your conclusion outside it, so the "
     "user sees the answer first and can open the thinking if they want it. Do "
     "not nest tags.\n\n"
@@ -348,6 +361,58 @@ SKILL_SYSTEM_PROMPT = (
     "Only propose a skill when the user has actually asked for one to be saved — not for "
     "ordinary answers, explanations or code examples."
 )
+
+# Shipped with the app and seeded into the Skills page on first run, then owned
+# by the user: editable, and gone for good if deleted. The layout prompt already
+# teaches the <table> syntax to every reply; this is the judgement that does not
+# belong in a prompt sent on every turn — when a table earns its place, and how
+# to choose the columns.
+BUILTIN_SKILLS = [{
+    "id": "builtin-tables",
+    "name": "Tables",
+    "content": (
+        "Apply this whenever an answer compares things, or lists records that "
+        "share the same fields.\n\n"
+        "## When a table earns its place\n\n"
+        "- Three or more items measured on the same two or more attributes.\n"
+        "- Anything the reader will scan down rather than read across: options "
+        "against criteria, before against after, a per-file or per-step "
+        "breakdown, errors against fixes.\n"
+        "- A single line of prose beats a one-row table. Two items with one "
+        "attribute each is a sentence, not a table.\n"
+        "- Never put prose in a table to make it look organised. If the cells "
+        "hold whole paragraphs, it is a list.\n\n"
+        "## How to write one\n\n"
+        "Use the <table> tag. It is the one tag that has tags inside it: each "
+        "row is a <row>, each cell in it a <cell>, and the first row is the "
+        "column headings.\n\n"
+        "<table>\n"
+        "<caption>Approaches compared</caption>\n"
+        "<row><cell>Approach</cell><cell>Speed</cell><cell>Trade-off</cell></row>\n"
+        "<row><cell>Index scan</cell><cell>12 ms</cell><cell>Needs the index "
+        "kept warm</cell></row>\n"
+        "<row><cell>Full scan</cell><cell>1.9 s</cell><cell>No setup at all"
+        "</cell></row>\n"
+        "</table>\n\n"
+        "## Choosing the columns\n\n"
+        "- First column identifies the row — the name, the file, the step "
+        "number. Keep it short; it is what the eye comes back to.\n"
+        "- One fact per column. A cell holding \"12 ms, needs a warm index\" is "
+        "two columns pretending to be one.\n"
+        "- Same unit down a column, and put the unit in the heading rather than "
+        "repeating it in every cell.\n"
+        "- Four to six columns reads well. More than that and the columns get "
+        "too narrow to scan — split it into two tables.\n"
+        "- Keep every row the same length. A short row is padded, so a missing "
+        "cell shows as a blank rather than shifting the row across.\n\n"
+        "## Avoid\n\n"
+        "- Drawing the table yourself out of `|`, `-`, `+` or box-drawing "
+        "characters. Those only line up in a fixed-width font and shear the "
+        "moment one value is too long; the tags are laid out as real columns.\n"
+        "- Repeating the table in prose underneath. Say what it shows — the "
+        "trend, the outlier, the recommendation — not what is already in it."
+    ),
+}]
 
 
 FENCE_RE = re.compile(r"^(`{3,})[ \t]*([A-Za-z0-9_+.#-]*)[ \t]*$")
@@ -971,8 +1036,15 @@ CODE_PX = 12
 CODE_PX_SM = 11
 UI_FONT = "Segoe UI"
 BODY_PX = 14
+# Table cells: a step down from prose, because a table is scanned rather than
+# read and the extra column width buys more than the extra point of size does.
+TABLE_PX = 13
 COLUMN_MAX = 880          # centred reading column
 BUBBLE_MAX = 720
+# What a block inside a bubble actually gets to work with: the bubble's own
+# border, and the padding its body layout puts around every child. Anything
+# laying itself out to BUBBLE_MAX overflows by exactly this much.
+BLOCK_MAX = BUBBLE_MAX - 34
 
 
 def mono_font(family: str, px: int) -> QFont:
@@ -1013,12 +1085,16 @@ CODE_FENCE_RE = re.compile(r"```(\w*)\n?(.*?)(?:```|$)", re.S)
 # Content tags the model is asked to wrap its output in, so each kind of content
 # gets its own container instead of one undifferentiated wall of prose. Matched
 # unclosed too, so a container appears as soon as the tag opens while streaming.
-TAG_NAMES = ("reasoning", "instructions", "math", "code", "text", "tasks")
+TAG_NAMES = ("reasoning", "instructions", "math", "code", "text", "tasks", "table")
 ACTION_NAMES = ("run", "search", "fetch", "skill", "recall")
 
 TAG_OPEN_RE = re.compile(
-    r"<(reasoning|instructions|math|code|text|tasks|run|search|fetch|skill|recall)"
-    r"(?:\s+lang=[\"']?([\w+#.-]+)[\"']?)?\s*>", re.I)
+    r"<(reasoning|instructions|math|code|text|tasks|table"
+    r"|run|search|fetch|skill|recall)"
+    # An attribute we do not use is still an attribute: `<table title="…">` has
+    # to open a table, not fall through and be shown as prose. Only name=value
+    # is tolerated, so an ordinary sentence in angle brackets stays prose.
+    r"(?:\s+lang=[\"']?([\w+#.-]+)[\"']?)?(?:\s+[\w-]+=[^<>]*)?\s*>", re.I)
 # What an *unclosed* tag gives way to: the next tag that opens. Content tags
 # only — deliberately NOT the action tags. If the model never closed
 # <reasoning>, a ```run after it is as likely to be a command it was turning
@@ -1026,9 +1102,9 @@ TAG_OPEN_RE = re.compile(
 # something nobody approved. It stays inside the thinking, where it cannot run,
 # and _nudge_if_stranded asks the model to close the tag and send it again.
 TAG_BOUNDARY_RE = re.compile(
-    r"<(?:reasoning|instructions|math|code|text|tasks)(?:\s+[^<>]*)?>", re.I)
+    r"<(?:reasoning|instructions|math|code|text|tasks|table)(?:\s+[^<>]*)?>", re.I)
 ORPHAN_CLOSE_RE = re.compile(
-    r"</(?:reasoning|instructions|math|code|text|tasks)\s*>", re.I)
+    r"</(?:reasoning|instructions|math|code|text|tasks|table)\s*>", re.I)
 
 # Models that keep their thinking in the content stream delimit it with their own
 # control tokens rather than a tag we asked for. Left alone, `<|END_THINKING|>`
@@ -1106,6 +1182,7 @@ TAG_LABELS = {
     "tasks": "Tasks",
     "text": "",
     "code": "",
+    "table": "Table",
 }
 
 
@@ -1132,6 +1209,16 @@ def split_blocks(text: str):
                 # Shown the same as the ```run fence it should have been, so a
                 # model that reaches for the tag form still reads correctly.
                 blocks.append(("code", kind, body.strip("\n")))
+            elif kind == "table":
+                caption, header, rows = parse_table(body)
+                # The tag says table, so one is drawn as soon as there is a
+                # header — the rows fill in beneath it as they stream. Waiting
+                # for the second row instead would show the header as a line of
+                # prose that then jumped into a grid.
+                if header:
+                    blocks.append(("table", caption, header, rows))
+                elif body.strip():
+                    blocks.extend(_split_fenced(body))   # never was one
             elif kind == "text":
                 blocks.extend(_split_fenced(body))
             elif kind == "reasoning" and blocks and blocks[-1][0] == "reasoning":
@@ -1159,13 +1246,239 @@ def _split_fenced(text: str):
         if prose.strip():
             for para in re.split(r"\n\s*\n", prose):
                 if para.strip():
-                    blocks.append(("prose", para))
+                    blocks.extend(_prose_blocks(para))
         if i + 2 < len(parts):
             lang, code = parts[i + 1], parts[i + 2]
             if code.strip():
                 blocks.append(("code", lang.strip(), code))
         i += 3
     return blocks
+
+
+# --------------------------------------------------------------------------- #
+#  Tables
+# --------------------------------------------------------------------------- #
+# A model that wants a table draws one out of characters, and characters are
+# where a table goes to die: the columns only line up in a monospaced face, a
+# cell cannot wrap without shearing the grid, and one value longer than the box
+# was drawn for slips every row beneath it. So the rows and cells are parsed
+# back out of whatever shape arrived and laid out as a real grid.
+
+# Rows and cells inside <table>. HTML's own names are accepted beside the ones
+# we teach: a model that has read a million <tr><td> pairs reaches for them
+# without being asked, and refusing the shape it already knows buys nothing.
+_ROW_OPEN = re.compile(r"<(?:row|tr)(?:\s+[^<>]*)?>", re.I)
+_ROW_CLOSE = re.compile(r"</(?:row|tr)\s*>", re.I)
+_CELL_OPEN = re.compile(r"<(?:cell|col|td|th)(?:\s+[^<>]*)?>", re.I)
+_CELL_CLOSE = re.compile(r"</(?:cell|col|td|th)\s*>", re.I)
+_CAPTION_RE = re.compile(r"<caption(?:\s+[^<>]*)?>(.*?)(?:</caption\s*>|$)", re.I | re.S)
+
+# Box-drawing characters, in every weight models reach for.
+BOX_VERT = "│┃║"
+BOX_ANY = "─│┌┐└┘├┤┬┴┼━┃┏┓┗┛┣┫┳┻╋═║╔╗╚╝╠╣╦╩╬╭╮╰╯"
+_PIPE_SPLIT = re.compile(r"(?<!\\)\|")
+_NUMERIC_RE = re.compile(r"^[-+(]?[$£€]?\s?\d[\d,._\s]*%?\)?$")
+
+
+def _tagged_pieces(text: str, open_re, close_re) -> list:
+    """Bodies of each open_re…close_re run, tolerating a missing closer.
+
+    An absent closing tag ends the piece where the next one opens — the rule
+    iter_tags uses, for the same reason. A table still being streamed always has
+    an unclosed final row, and it should appear as a row rather than vanish and
+    pop back into existence when the closing tag lands.
+    """
+    out = []
+    for m in open_re.finditer(text):
+        close = close_re.search(text, m.end())
+        nxt = open_re.search(text, m.end())
+        if close and (nxt is None or close.start() <= nxt.start()):
+            stop = close.start()
+        elif nxt:
+            stop = nxt.start()
+        else:
+            stop = len(text)
+        out.append(text[m.end():stop])
+    return out
+
+
+def _clean_cell(text: str) -> str:
+    """One cell's text: no stray markup, and no line breaks of its own.
+
+    A cell wraps to the width the column is given, so whatever line breaks it
+    arrived with — the box it was drawn in, or a wrapped source line — are the
+    old layout's, not the new one's.
+    """
+    return re.sub(r"\s+", " ", ORPHAN_CLOSE_RE.sub("", text)).strip()
+
+
+def _is_rule(line: str) -> bool:
+    """A separator line: markdown's ---|--- or any box-drawn rule."""
+    s = line.strip()
+    return bool(s) and not set(s) - set(BOX_ANY + "|+-=: ")
+
+
+def _cells_from_line(line: str) -> list:
+    s = line.strip()
+    for ch in BOX_VERT:
+        s = s.replace(ch, "|")
+    s = s.strip().strip("|")
+    return [c.replace("\\|", "|") for c in _PIPE_SPLIT.split(s)]
+
+
+def _rows_from_text(text: str) -> list:
+    """Rows out of a pipe or box-drawn table.
+
+    The hard part is telling a wrapped row from the next row. A drawn table has
+    a fixed width, so a cell too long for its column spills onto the line below
+    and has to be joined back on; a markdown table never does that, and joining
+    it the same way collapses every row into one.
+
+    The tell is that a spill leaves the columns it did not come from **empty**,
+    while a real row fills them. So a following line is treated as the same row
+    only when the table is drawn at all — box characters, or `+---+` rules — and
+    that line has a blank cell. A `+---+` table that rules off only its header
+    is read correctly by the same rule, without having to guess from the rules.
+    """
+    lines = text.splitlines()
+    drawn = (any(ch in text for ch in BOX_ANY)
+             or any("+" in ln and _is_rule(ln) for ln in lines))
+    rows, group = [], []
+
+    def flush():
+        if not group:
+            return
+        width = max(len(g) for g in group)
+        joined = []
+        for i in range(width):
+            parts = [g[i].strip() for g in group if i < len(g) and g[i].strip()]
+            joined.append(" ".join(parts))
+        if any(joined):
+            rows.append(joined)
+        group.clear()
+
+    for line in lines:
+        if not line.strip() or _is_rule(line):
+            flush()
+            continue
+        cells = [_clean_cell(c) for c in _cells_from_line(line)]
+        if len(cells) < 2:
+            flush()
+            continue
+        if not (drawn and any(c == "" for c in cells)):
+            flush()                        # a row of its own, not a spill
+        group.append(cells)
+    flush()
+    return rows
+
+
+def parse_table(body: str):
+    """(caption, header, rows) from the body of a <table>.
+
+    Three shapes go in and the same table comes out: the <row>/<cell> form the
+    model is taught, markdown pipes, and box-drawn characters. Only the first is
+    documented, but a model drifts to the other two under load, and a table that
+    renders as a wall of broken pipes is worse than never asking for one.
+    """
+    caption = ""
+    m = _CAPTION_RE.search(body)
+    if m:
+        caption = _clean_cell(m.group(1))
+        body = body[:m.start()] + body[m.end():]
+    rows = []
+    if _ROW_OPEN.search(body):
+        for chunk in _tagged_pieces(body, _ROW_OPEN, _ROW_CLOSE):
+            cells = _tagged_pieces(chunk, _CELL_OPEN, _CELL_CLOSE)
+            if not cells:                      # a row written as one pipe line
+                cells = _cells_from_line(chunk)
+            cells = [_clean_cell(c) for c in cells]
+            if any(cells):
+                rows.append(cells)
+    else:
+        rows = _rows_from_text(body)
+    if not rows:
+        return caption, [], []
+    width = max(len(r) for r in rows)
+    padded = [list(r) + [""] * (width - len(r)) for r in rows]
+    return caption, padded[0], padded[1:]
+
+
+def table_markdown(caption: str, header: list, rows: list) -> str:
+    """The table as markdown — what Copy puts on the clipboard, and what gets
+    written back into the transcript when a chat is exported."""
+    def line(cells):
+        return "| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |"
+
+    out = [caption] if caption else []
+    out.append(line(header))
+    out.append("|" + "|".join("---" for _ in header) + "|")
+    out.extend(line(r) for r in rows)
+    return "\n".join(out)
+
+
+def _tableish(line: str) -> bool:
+    """Could this line belong to a table? A rule counts, or the run would break
+    at the `+---+---+` between two rows and neither half would be a table."""
+    s = line.strip()
+    if not s:
+        return False
+    if any(ch in s for ch in BOX_ANY) or s.count("|") >= 2:
+        return True
+    return len(s) >= 5 and _is_rule(s) and bool(set(s) & set("+|"))
+
+
+def _table_block(text: str):
+    """A table block from loose text, or None if it is only prose with pipes."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    if not any(ch in text for ch in BOX_ANY):
+        # Two lines that merely happen to contain pipes are prose. A real
+        # markdown table either rules off its header or holds its column count.
+        counts = {ln.count("|") for ln in lines}
+        if not (any(_is_rule(ln) for ln in lines) or len(counts) == 1):
+            return None
+    caption, header, rows = parse_table(text)
+    if len(header) < 2 or not rows:
+        return None
+    return ("table", caption, header, rows)
+
+
+def _prose_blocks(para: str) -> list:
+    """Prose, with any table found inside it promoted to a real table block.
+
+    The tag is the reliable way to ask for a table, not the only way to get one:
+    models produce them unprompted, in markdown pipes if they have manners and
+    in box-drawing characters if they do not. Both are picked up here, so the
+    feature does not depend on the model having read the instructions.
+    """
+    out, plain, run = [], [], []
+
+    def flush_plain():
+        if any(ln.strip() for ln in plain):
+            out.append(("prose", "\n".join(plain).strip()))
+        plain.clear()
+
+    def flush_run():
+        if not run:
+            return
+        block = _table_block("\n".join(run))
+        if block:
+            flush_plain()
+            out.append(block)
+        else:
+            plain.extend(run)          # not a table after all: still prose
+        run.clear()
+
+    for line in para.split("\n"):
+        if _tableish(line):
+            run.append(line)
+        else:
+            flush_run()
+            plain.append(line)
+    flush_run()
+    flush_plain()
+    return out
 
 
 def _inline(text: str) -> str:
@@ -2108,6 +2421,10 @@ class Bubble(QWidget):
                 widget.set_text(block[1])
                 self._rendered = list(blocks)
                 return
+            if block[0] == "table" and isinstance(widget, TableBlock):
+                widget.set_table(block[1], block[2], block[3])
+                self._rendered = list(blocks)
+                return
             if (block[0] in ("instructions", "math", "tasks")
                     and isinstance(widget, LabelledBlock)):
                 widget.set_body(block[1])
@@ -2136,6 +2453,9 @@ class Bubble(QWidget):
             panel = ReasoningPanel(self.mono)
             panel.set_text(block[1])
             return panel
+        if kind == "table":
+            _, caption, header, rows = block
+            return TableBlock(caption, header, rows, self.mono)
         return LabelledBlock(kind, block[1], self.mono)
 
     def set_error(self, text: str):
@@ -2285,6 +2605,267 @@ class LabelledBlock(QFrame):
             else:
                 out.append(text)
         return "<br>".join(out)
+
+
+class TableBlock(QFrame):
+    """A real table: columns that align, a header that stays a header, and cells
+    that wrap instead of shearing the grid.
+
+    Widths are the whole job. A table where every column is the same width
+    wastes the narrow ones and starves the wide — an index column needs 30px
+    and a sentence of explanation needs 300 — so each column asks for what its
+    content actually needs, and only gives ground when they do not all fit.
+    """
+
+    MIN_COL = 66              # below this, ordinary words break mid-way
+    MAX_COL = 380             # no single column eats the whole table
+    PAD_H, PAD_V = 11, 7      # must match the padding in #tableCell's QSS
+    BORDER = 2                # the container's own left and right edges
+
+    def __init__(self, caption: str, header: list, rows: list, mono: str):
+        super().__init__()
+        self.setObjectName("tableBlock")
+        self.mono = mono
+        self._data = None
+        # How much width there is to lay out in. Starts at the most a bubble can
+        # ever offer and is corrected to the real figure once there is a parent
+        # to ask — with both side panels open the bubble is barely two thirds of
+        # that, and a table built for the maximum scrolled sideways in a gap it
+        # could have fitted.
+        self._budget = BLOCK_MAX
+        self._watching = None
+        self._font = QFont(UI_FONT)
+        self._font.setPixelSize(TABLE_PX)
+        self._bold = QFont(self._font)
+        self._bold.setWeight(QFont.Weight.DemiBold)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        bar = QWidget()
+        bar.setObjectName("tableHeader")
+        hl = QHBoxLayout(bar)
+        hl.setContentsMargins(12, 6, 8, 6)
+        self.caption = QLabel("Table")
+        self.caption.setObjectName("tableCaption")
+        hl.addWidget(self.caption)
+        hl.addStretch()
+        self.copy_btn = QPushButton("Copy")
+        self.copy_btn.setObjectName("copyBtn")
+        self.copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.copy_btn.clicked.connect(self._copy)
+        hl.addWidget(self.copy_btn)
+        v.addWidget(bar)
+
+        self.host = QWidget()
+        self.host.setObjectName("tableGrid")
+        self.grid = QGridLayout(self.host)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(0)
+
+        # A bar only ever appears for a table with more columns than the bubble
+        # can show at a legible width. Everything narrower is sized to fit.
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("tableScroll")
+        self.scroll.setWidget(self.host)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        v.addWidget(self.scroll)
+
+        self.set_table(caption, header, rows)
+
+    # -- layout ------------------------------------------------------------- #
+    def set_table(self, caption: str, header: list, rows: list):
+        """Rebuild only when a cell actually changed.
+
+        Chunks arrive far faster than rows complete, so most of them parse to
+        exactly the table already on screen. Comparing first means a streaming
+        table rebuilds once per row rather than once per token.
+        """
+        data = (caption, tuple(header), tuple(tuple(r) for r in rows))
+        if data == self._data:
+            return
+        self._data = data
+        self.caption.setText(caption or "Table")
+
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+                widget.deleteLater()
+
+        cols = len(header)
+        widths = self._widths(header, rows)
+        aligns = self._alignments(rows, cols)
+        for r, cells in enumerate([header] + list(rows)):
+            labels = []
+            for c in range(cols):
+                text = cells[c] if c < len(cells) else ""
+                labels.append(self._cell(text, widths[c], aligns[c], r))
+            height = max(self._text_height(cells[c] if c < len(cells) else "",
+                                           widths[c], r == 0)
+                         for c in range(cols)) + 2 * self.PAD_V
+            for c, lbl in enumerate(labels):
+                lbl.setFixedHeight(height)
+                self.grid.addWidget(lbl, r, c)
+                # A widget put into the layout of a parent that is itself only
+                # part-way through being shown is left hidden, and a hidden
+                # widget contributes nothing to the layout — the whole table
+                # collapsed to an empty box whenever it was rebuilt from
+                # showEvent, which is exactly when it fits itself to the bubble.
+                lbl.show()
+        # Keeps the last row's background off the container's rounded corner.
+        self.grid.setRowMinimumHeight(len(rows) + 1, 6)
+
+        total = sum(widths)
+        self.host.setMinimumWidth(total)
+        # Hug the content: a narrow table left to fill the bubble would stripe
+        # its rows only part of the way across.
+        self.setMaximumWidth(min(self._budget, total + self.BORDER))
+        self._autosize(total)
+
+    def _autosize(self, total: int):
+        # The grid has just been rebuilt, and an unactivated layout still
+        # reports the size hint of the rows it used to hold. Reading that on a
+        # rebuild — which is what fitting to the bubble does — gave the scroll
+        # area the old height and clipped the whole table out of sight.
+        self.grid.invalidate()
+        self.grid.activate()
+        height = self.host.sizeHint().height()
+        if total > self._budget - self.BORDER:
+            height += self.scroll.horizontalScrollBar().sizeHint().height()
+        self.scroll.setFixedHeight(height)
+
+    # -- fitting the space actually on offer -------------------------------- #
+    def showEvent(self, event):
+        super().showEvent(event)
+        parent = self.parentWidget()
+        if parent is not None and parent is not self._watching:
+            # Watch the bubble rather than ourselves: our own width is capped to
+            # the table, so a bubble that grows would never resize us and the
+            # table would stay stuck at whatever width it was first built for.
+            if self._watching is not None:
+                self._watching.removeEventFilter(self)
+            parent.installEventFilter(self)
+            self._watching = parent
+        self._fit_parent()
+
+    def eventFilter(self, obj, event):
+        if obj is self._watching and event.type() == QEvent.Type.Resize:
+            self._fit_parent()
+        return False
+
+    def _fit_parent(self):
+        parent = self.parentWidget()
+        if parent is None or parent.width() <= 0:
+            return
+        budget = max(240, min(BLOCK_MAX, parent.width() - 34))
+        if abs(budget - self._budget) <= 2:
+            return
+        self._budget = budget
+        caption, header, rows = self._data
+        self._data = None                            # force the rebuild
+        self.set_table(caption, list(header), [list(r) for r in rows])
+
+    def _widths(self, header: list, rows: list) -> list:
+        """What each column asks for, then what it has to settle for.
+
+        When the natural widths do not fit, the surplus is taken from the
+        greediest first: the widest column gives ground before a two-character
+        one loses a pixel. Sharing the shortfall evenly instead would squeeze a
+        `#` column no one needed to squeeze.
+        """
+        cols = len(header)
+        pad = 2 * self.PAD_H
+        natural = []
+        for c in range(cols):
+            widest = self._ideal_width(header[c], True)
+            for row in rows:
+                if c < len(row):
+                    widest = max(widest, self._ideal_width(row[c], False))
+            natural.append(min(self.MAX_COL, max(self.MIN_COL, widest + pad)))
+
+        avail = self._budget - self.BORDER
+        if sum(natural) <= avail:
+            return natural
+        widths = [0] * cols
+        remaining, left = avail, cols
+        for i in sorted(range(cols), key=lambda k: natural[k]):
+            share = remaining // max(1, left)
+            widths[i] = natural[i] if natural[i] <= share else max(self.MIN_COL, share)
+            remaining -= widths[i]
+            left -= 1
+        return widths
+
+    def _alignments(self, rows: list, cols: int) -> list:
+        """Right-align a column whose values are all numbers, so the digits line
+        up. Judged on the data only — a header is a word either way."""
+        out = []
+        for c in range(cols):
+            vals = [r[c] for r in rows if c < len(r) and r[c]]
+            out.append(bool(vals) and all(_NUMERIC_RE.match(v) for v in vals))
+        return out
+
+    def _doc(self, text: str, head: bool) -> QTextDocument:
+        """A cell measured the way it will be painted.
+
+        Cells hold rich text, so QLabel lays them out with a QTextDocument —
+        which wraps at different points, and stacks its lines at a different
+        pitch, from QFontMetrics. Measure with the wrong one and every cell is
+        out by a few pixels across and about a line down: columns squeezed words
+        they had room for, and wrapped rows were cut off mid-sentence. The rows
+        that got cut were the long ones, which are the ones worth reading.
+        """
+        doc = QTextDocument()
+        doc.setDefaultFont(self._bold if head else self._font)
+        doc.setHtml(_inline(text) or "&nbsp;")
+        return doc
+
+    def _ideal_width(self, text: str, head: bool) -> int:
+        doc = self._doc(text, head)
+        doc.setTextWidth(-1)
+        return int(doc.idealWidth()) + 1        # idealWidth is fractional
+
+    def _text_height(self, text: str, width: int, head: bool) -> int:
+        doc = self._doc(text, head)
+        doc.setTextWidth(max(20, width - 2 * self.PAD_H))
+        # The header carries the rule under it, which is a pixel of its own.
+        return int(doc.size().height()) + 2 * self.PAD_V + (1 if head else 0)
+
+    def _cell(self, text: str, width: int, right: bool, row: int) -> QLabel:
+        lbl = QLabel(_inline(text))
+        if row == 0:
+            lbl.setObjectName("tableHead")
+        else:
+            lbl.setObjectName("tableCellAlt" if row % 2 == 0 else "tableCell")
+        # The font is set here and not in the stylesheet because the widths and
+        # heights above are measured from it; a QSS font-size would win at paint
+        # time and every row would be measured against the wrong metrics.
+        lbl.setFont(self._bold if row == 0 else self._font)
+        lbl.setWordWrap(True)
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lbl.setAlignment((Qt.AlignmentFlag.AlignRight if right
+                          else Qt.AlignmentFlag.AlignLeft)
+                         | Qt.AlignmentFlag.AlignTop)
+        lbl.setFixedWidth(width)
+        return lbl
+
+    def _copy(self):
+        caption, header, rows = self._data
+        QApplication.clipboard().setText(
+            table_markdown(caption, list(header), [list(r) for r in rows]))
+        self.copy_btn.setText("Copied")
+        # Parented, so switching chats takes the timer with the button rather
+        # than firing it at a freed C++ object.
+        reset = QTimer(self.copy_btn)
+        reset.setSingleShot(True)
+        reset.timeout.connect(lambda: self.copy_btn.setText("Copy"))
+        reset.start(1200)
 
 
 class ToolCard(QFrame):
@@ -3455,6 +4036,7 @@ class CriGent(QMainWindow):
         self.skills = self._read_skills_file()
         self.prompts = self._read_prompts_file()
         self.settings = self._read_settings()
+        self._seed_builtin_skills()
         self.usage = load_usage()
         self._import_worker = None
 
@@ -6038,6 +6620,28 @@ class CriGent(QMainWindow):
         except Exception:                                          # noqa: BLE001
             return []
 
+    def _seed_builtin_skills(self):
+        """Put the skills shipped with the app into the list, once.
+
+        Which id has been seeded is remembered separately from the skills
+        themselves, so a user who deletes one — or edits it down to a line —
+        does not get the original handed back on the next launch. Upgrading is
+        then also how a genuinely new built-in skill arrives.
+        """
+        seeded = set(self.settings.get("seeded_skills") or [])
+        have = {sk.get("id") for sk in self.skills}
+        added = False
+        for skill in BUILTIN_SKILLS:
+            if skill["id"] in seeded or skill["id"] in have:
+                continue
+            self.skills.append(dict(skill, created=time.time(), updated=time.time()))
+            seeded.add(skill["id"])
+            added = True
+        if added:
+            self.settings["seeded_skills"] = sorted(seeded)
+            self._save_skills()
+            self._save_settings()
+
     def _save_skills(self):
         _atomic_write_json(SKILLS_PATH, self.skills)
 
@@ -6464,6 +7068,30 @@ class CriGent(QMainWindow):
         #mathTitle {{ color:{C['violet']}; font-size:11px; font-weight:700;
                       letter-spacing:0.6px; }}
         #blockBody {{ background:transparent; color:{C['text']}; line-height:155%; }}
+
+        /* tables. No vertical rules and no rule under the last row: alignment
+           and alternating rows already separate the cells, and a border at the
+           edge of a rounded card only ever shows as a doubled line. */
+        #tableBlock {{ background:{C['panel_hi']}; border:1px solid {C['line']};
+                       border-radius:10px; }}
+        #tableHeader {{ background:{C['panel']};
+                        border-bottom:1px solid {C['line']};
+                        border-top-left-radius:10px; border-top-right-radius:10px; }}
+        #tableCaption {{ color:{C['faint']}; font-size:11px; font-weight:600;
+                         letter-spacing:0.5px; }}
+        #tableScroll, #tableGrid {{ background:transparent; border:none; }}
+        /* The padding must match TableBlock.PAD_H / PAD_V and the size must
+           match TABLE_PX: both are what every column width and row height is
+           measured against, and a stylesheet font-size beats setFont at paint
+           time. Leave the size off and cells are measured at 13px, painted at
+           the app's 14px, and clipped on every wrapped line. */
+        #tableHead {{ background:{C['overlay']}; color:{C['text']};
+                      font-size:{TABLE_PX}px; font-weight:600;
+                      border-bottom:1px solid {C['line_str']}; padding:7px 11px; }}
+        #tableCell {{ background:transparent; color:{C['text']};
+                      font-size:{TABLE_PX}px; padding:7px 11px; }}
+        #tableCellAlt {{ background:{C['panel']}; color:{C['text']};
+                         font-size:{TABLE_PX}px; padding:7px 11px; }}
         /* per-message actions: quiet until you go looking for them */
         #msgAction {{ background:transparent; border:1px solid transparent;
                       border-radius:7px; color:{C['faint']}; font-size:11px;

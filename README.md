@@ -110,8 +110,8 @@ task rather than waiting to hit the wall mid-answer.
 
 **6 · Replies laid out by what they contain**
 
-Reasoning, steps, equations and code each get their own container rather than
-arriving as one wall of text. Thinking collapses to its newest line, so you can
+Reasoning, steps, equations, code and tables each get their own container rather
+than arriving as one wall of text. Thinking collapses to its newest line, so you can
 see where the model has got to without it burying the answer — click it to read
 the whole trace.
 
@@ -120,6 +120,43 @@ can be edited: that puts it back in the box and rewinds the conversation to that
 point, instead of asking again underneath.
 
 ![A tagged reply](docs/06-tagged-reply.png)
+
+**6b · Tables that are actually tables**
+
+Ask a local model to compare things and it draws you a table out of characters —
+pipes, dashes, box-drawing corners. That only lines up in a fixed-width font, no
+cell can wrap without shearing the grid, and one value longer than the box was
+drawn for slips every row beneath it. Worse, if the reply is cut short the table
+is left half-drawn.
+
+CriGent lays out real columns instead. Each column is measured against its own
+content, so an index column stays narrow and a column of explanation gets the
+room it needs; long cells wrap rather than overflow, columns of numbers line up
+on the right, and the whole thing resizes with the window.
+
+![Tables](docs/12-tables.png)
+
+The model is asked to write a table as tags — it is the one tag with tags inside
+it:
+
+```
+<table>
+<caption>13B quantisations, 16 GB VRAM</caption>
+<row><cell>Build</cell><cell>VRAM</cell><cell>Tokens/s</cell></row>
+<row><cell>Q8_0</cell><cell>15.1 GB</cell><cell>18.4</cell></row>
+<row><cell>Q5_K_M</cell><cell>10.4 GB</cell><cell>41.7</cell></row>
+</table>
+```
+
+That is the reliable way to ask for one, not the only way to get one. A model
+that draws its own table in markdown pipes or box-drawing characters gets a real
+one anyway — those are recognised and turned back into rows and columns, wrapped
+cells and all. **Copy** puts it on the clipboard as markdown, ready to paste
+somewhere else.
+
+A **Tables** skill ships with the app, on the Skills page, covering the part that
+is judgement rather than syntax: when a table earns its place, and how to choose
+the columns. Tick it on when you want it. It is yours to edit or delete.
 
 **7 · Keep a library of skills**
 
@@ -242,7 +279,8 @@ points CriGent at the existing one.
 | | |
 |---|---|
 | **Chat** | Streamed replies, per-message timing and tokens/sec. Conversations are saved automatically and listed in the sidebar. |
-| **Layout** | Reasoning, instructions, maths and code each get their own container, with a copy button on code. Thinking collapses to its latest line and expands to the full trace. |
+| **Layout** | Reasoning, instructions, maths, code and tables each get their own container, with a copy button on code. Thinking collapses to its latest line and expands to the full trace. |
+| **Tables** | Real columns, sized to their content, wrapping instead of shearing, and resizing with the window. Asked for with tags; a table the model drew itself in pipes or box-drawing characters is recognised and laid out properly too. Copy takes it as markdown. |
 | **Redo a turn** | Copy any message, regenerate a reply, or edit a prompt — editing rewinds the conversation to that point rather than asking again underneath. |
 | **Models** | See everything installed with size and quantisation, delete with one click, or add any `.gguf` — CriGent writes the Modelfile and imports it for you. Switch models mid-conversation. |
 | **Tools** | The model can propose a PowerShell command. You see the exact command and click **Run** or **Deny**; its output is fed back so it can continue. |
