@@ -204,13 +204,18 @@ you never have to guess from a file's date.
 
 ![About](docs/10-about.png)
 
-**10b · Off-white by default, Dark if you'd rather**
+**11 · Settings — theme and fonts**
 
-CriGent opens in an off-white theme. Switch to the original dark scheme from
-the same About page — it applies straight away, and is remembered next time
-you open the app.
+CriGent opens in an off-white theme; switch to the original dark scheme on the
+Settings page, next to the nav. It applies straight away, and is remembered
+next time you open the app.
 
-![Theme](docs/14-theme.png)
+Below it, the reply text's own font: pick any installed family from the
+dropdown, a size in pixels, and Bold — a live example updates as you choose,
+and the change reaches the chat immediately, no restart. Code and tables keep
+their own size on purpose, so this only touches what you actually read.
+
+![Settings](docs/15-settings.png)
 
 ---
 
@@ -312,7 +317,7 @@ points CriGent at the existing one.
 | **Context** | How much the model holds in mind at once, from the model's own setting up to 128K. A reply that runs out of room is continued automatically rather than left hanging. |
 | **Compaction** | When the conversation approaches the window, the older part is replaced — for the model — by a verbatim facts ledger plus a summary, and work carries on from that. Automatic, or on demand with **Compact**. The transcript you see and the file on disk are never shortened. |
 | **Recall** | Anything compaction moved out of the prompt can be read back verbatim: the model searches the stored transcript rather than guessing at a detail it no longer has in front of it. |
-| **Theme** | Off-white by default; switch to Dark on the About page. Applies immediately and is remembered. |
+| **Settings** | Theme (off-white or Dark) and the reply text's font — family, size in pixels, Bold — with a live example. Both apply immediately and are remembered. |
 
 ### ⚠️ About Auto-run
 

@@ -37,11 +37,12 @@ from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase,
                          QFontMetrics, QIcon, QLinearGradient, QPainter,
                          QPainterPath, QPen, QPixmap, QTextCursor, QTextDocument)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
-                             QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
+                             QComboBox, QDialog, QFileDialog, QFontComboBox, QFrame,
+                             QGridLayout,
                              QHBoxLayout, QInputDialog, QLabel, QLineEdit,
                              QListWidget, QListWidgetItem, QMainWindow, QMenu,
                              QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-                             QScrollArea,
+                             QScrollArea, QSpinBox,
                              QSizePolicy, QStackedWidget, QTextEdit, QVBoxLayout,
                              QWidget)
 
@@ -50,7 +51,7 @@ APP_TAGLINE = "A local AI agent — your models, your machine."
 # Shown on the About page and stamped into every logged error, so a report can
 # be tied to a build. Bump this in the same commit as the release tag — a
 # version the app cannot tell you is a version you cannot check.
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 DEV_NAME = "Abdulaziz Al Jumaia"
 DEV_SITE = "https://crimsonlingua.com"
 DEV_LINKEDIN = "https://sa.linkedin.com/in/abdulaziz-al-jumaia"
@@ -638,7 +639,8 @@ MODELS_DIR = ROOT / "models"
 
 # Nav order. Pages are looked up by name everywhere else: inserting one here
 # used to silently shift the hard-coded indices that drive per-page refreshes.
-PAGES = ("Chat", "Track", "Usage", "Prompts", "Skills", "Err logs", "Models", "About")
+PAGES = ("Chat", "Track", "Usage", "Prompts", "Skills", "Err logs", "Models",
+         "Settings", "About")
 
 
 def page_index(name: str) -> int:
@@ -1060,8 +1062,26 @@ def mono_family() -> str:
 # that actually paints the text, and every fixed height would clip its content.
 CODE_PX = 12
 CODE_PX_SM = 11
-UI_FONT = "Segoe UI"
-BODY_PX = 14
+DEFAULT_UI_FONT = "Segoe UI"
+DEFAULT_BODY_PX = 14
+# The reading font: the chat prose (#proseUser/#proseBot). Family also becomes
+# the QApplication default, so it reaches every widget that never called its
+# own setFont() — which in this app is nearly everything except code and
+# tables, each sized on purpose to be a step apart from prose. Mutated in
+# place by apply_font(), same trick as C for the theme: nothing downstream
+# holds a copy of these, only the names themselves, read fresh each call.
+UI_FONT = DEFAULT_UI_FONT
+BODY_PX = DEFAULT_BODY_PX
+UI_BOLD = False
+
+
+def apply_font(family: str, size: int, bold: bool):
+    global UI_FONT, BODY_PX, UI_BOLD
+    UI_FONT = family or DEFAULT_UI_FONT
+    BODY_PX = size or DEFAULT_BODY_PX
+    UI_BOLD = bool(bold)
+
+
 # Table cells: a step down from prose, because a table is scanned rather than
 # read and the extra column width buys more than the extra point of size does.
 TABLE_PX = 13
@@ -4075,6 +4095,16 @@ class CriGent(QMainWindow):
         self.prompts = self._read_prompts_file()
         self.settings = self._read_settings()
         apply_theme(self.settings.get("theme", DEFAULT_THEME))
+        apply_font(self.settings.get("font_family", DEFAULT_UI_FONT),
+                  self.settings.get("font_size", DEFAULT_BODY_PX),
+                  self.settings.get("font_bold", False))
+        # main() already set the app-wide default font before this window ever
+        # existed, using the literal "Segoe UI" — restate it now that the
+        # saved family (if any) is known, so a non-default choice is in effect
+        # before a single widget gets built.
+        app = QApplication.instance()
+        if app is not None:
+            app.setFont(QFont(UI_FONT, 10))
         self._seed_builtin_skills()
         self.usage = load_usage()
         self._import_worker = None
@@ -4202,7 +4232,7 @@ class CriGent(QMainWindow):
             "Chat": self._chat_tab, "Track": self._gpu_tab, "Usage": self._usage_tab,
             "Prompts": self._prompts_tab, "Skills": self._skills_tab,
             "Err logs": self._crashes_tab, "Models": self._models_tab,
-            "About": self._about_tab,
+            "Settings": self._settings_tab, "About": self._about_tab,
         }
         for name in PAGES:
             self.stack.addWidget(builders[name]())
@@ -5197,6 +5227,108 @@ class CriGent(QMainWindow):
             pass
         self.prompt_status.setText("All prompts restored to the originals and saved.")
 
+    # -- settings page ------------------------------------------------------ #
+    def _settings_tab(self) -> QWidget:
+        page, body = self._page(
+            "Settings", "Appearance — how CriGent looks, not what it can do.")
+
+        theme_card = Card("Theme")
+        theme_row = QHBoxLayout()
+        theme_row.setSpacing(8)
+        self.theme_group = QButtonGroup(self)
+        self.theme_group.setExclusive(True)
+        current_theme = self.settings.get("theme", DEFAULT_THEME)
+        for key, label in (("light", "Off-white"), ("dark", "Dark")):
+            btn = QPushButton(label)
+            btn.setObjectName("pillTheme")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setChecked(key == current_theme)
+            self.theme_group.addButton(btn)
+            btn.clicked.connect(lambda _checked, k=key: self._on_theme_changed(k))
+            theme_row.addWidget(btn)
+        theme_row.addStretch()
+        theme_card.box.addLayout(theme_row)
+        theme_note = QLabel("Off-white is the default; Dark is there if you prefer it.")
+        theme_note.setObjectName("pageSub")
+        theme_card.box.addWidget(theme_note)
+        body.addWidget(theme_card)
+
+        font_card = Card("Fonts")
+
+        font_row = QHBoxLayout()
+        font_row.setSpacing(8)
+        self.font_combo = QFontComboBox()
+        self.font_combo.setObjectName("computePicker")
+        self.font_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.font_combo.setCurrentFont(QFont(self.settings.get("font_family", UI_FONT)))
+        self.font_combo.currentFontChanged.connect(self._on_font_changed)
+        font_row.addWidget(self.font_combo, 1)
+
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setObjectName("fontSizeSpin")
+        self.font_size_spin.setRange(11, 22)
+        self.font_size_spin.setSuffix(" px")
+        self.font_size_spin.setValue(int(self.settings.get("font_size", BODY_PX)))
+        self.font_size_spin.valueChanged.connect(self._on_font_changed)
+        font_row.addWidget(self.font_size_spin)
+
+        self.font_bold_btn = QPushButton("Bold")
+        self.font_bold_btn.setObjectName("pillTheme")
+        self.font_bold_btn.setCheckable(True)
+        self.font_bold_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.font_bold_btn.setChecked(bool(self.settings.get("font_bold", UI_BOLD)))
+        self.font_bold_btn.toggled.connect(self._on_font_changed)
+        font_row.addWidget(self.font_bold_btn)
+        font_card.box.addLayout(font_row)
+
+        font_note = QLabel("Applies to the reply text. Code and tables keep their own size, "
+                           "sized apart from prose on purpose.")
+        font_note.setObjectName("pageSub")
+        font_note.setWordWrap(True)
+        font_card.box.addWidget(font_note)
+
+        self.font_preview = QLabel(
+            "The quick brown fox jumps over the lazy dog — 0123456789")
+        self.font_preview.setObjectName("fontPreview")
+        self.font_preview.setWordWrap(True)
+        font_card.box.addWidget(self.font_preview)
+        self._update_font_preview()
+        body.addWidget(font_card)
+
+        body.addStretch()
+        return page
+
+    def _update_font_preview(self):
+        # setFont() alone loses to the base `QWidget { font-size:14px }` rule
+        # in the app stylesheet — a widget's own stylesheet is what actually
+        # wins that cascade, so the live preview needs one of its own.
+        family = self.font_combo.currentFont().family()
+        size = self.font_size_spin.value()
+        weight = 600 if self.font_bold_btn.isChecked() else 400
+        self.font_preview.setStyleSheet(
+            f"#fontPreview {{ font-family:'{family}'; font-size:{size}px; "
+            f"font-weight:{weight}; }}")
+
+    def _on_font_changed(self, *_args):
+        family = self.font_combo.currentFont().family()
+        size = self.font_size_spin.value()
+        bold = self.font_bold_btn.isChecked()
+        self._update_font_preview()
+        if (self.settings.get("font_family", UI_FONT) == family
+                and self.settings.get("font_size", BODY_PX) == size
+                and self.settings.get("font_bold", UI_BOLD) == bold):
+            return
+        apply_font(family, size, bold)
+        self.settings["font_family"] = family
+        self.settings["font_size"] = size
+        self.settings["font_bold"] = bold
+        self._save_settings()
+        app = QApplication.instance()
+        if app is not None:
+            app.setFont(QFont(UI_FONT, 10))
+        self.setStyleSheet(self._qss())
+
     # -- about page ------------------------------------------------------- #
     def _about_tab(self) -> QWidget:
         page, body = self._page("About", "")
@@ -5238,28 +5370,6 @@ class CriGent(QMainWindow):
         top.addLayout(titles, 1)
         hero.box.addLayout(top)
         body.addWidget(hero)
-
-        theme_card = Card("Theme")
-        theme_row = QHBoxLayout()
-        theme_row.setSpacing(8)
-        self.theme_group = QButtonGroup(self)
-        self.theme_group.setExclusive(True)
-        current_theme = self.settings.get("theme", DEFAULT_THEME)
-        for key, label in (("light", "Off-white"), ("dark", "Dark")):
-            btn = QPushButton(label)
-            btn.setObjectName("pillTheme")
-            btn.setCheckable(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setChecked(key == current_theme)
-            self.theme_group.addButton(btn)
-            btn.clicked.connect(lambda _checked, k=key: self._on_theme_changed(k))
-            theme_row.addWidget(btn)
-        theme_row.addStretch()
-        theme_card.box.addLayout(theme_row)
-        note = QLabel("Off-white is the default; Dark is there if you prefer it.")
-        note.setObjectName("pageSub")
-        theme_card.box.addWidget(note)
-        body.addWidget(theme_card)
 
         dev = Card("Developer")
         who = QLabel(DEV_NAME)
@@ -7036,6 +7146,14 @@ class CriGent(QMainWindow):
                         border:1px solid {C['line_str']}; border-radius:8px;
                         selection-background-color:{C['accent']}; selection-color:#0b1220;
                         outline:none; padding:4px; }}
+        #fontSizeSpin {{ background:{C['panel_hi']}; color:{C['text']};
+                         border:1px solid {C['line']}; border-radius:8px;
+                         padding:6px 8px; font-size:12px; font-weight:500;
+                         min-width:64px; }}
+        #fontSizeSpin:hover {{ border-color:{C['line_str']}; }}
+        #fontPreview {{ background:{C['panel_hi']}; color:{C['text']};
+                        border:1px solid {C['line']}; border-radius:8px;
+                        padding:14px 16px; }}
         #modelPicker QAbstractItemView {{ background:{C['panel_hi']}; color:{C['text']};
                         border:1px solid {C['line_str']}; border-radius:8px;
                         selection-background-color:{C['accent']}; selection-color:#0b1220;
@@ -7100,7 +7218,8 @@ class CriGent(QMainWindow):
         #bubble_bot  {{ background:{C['panel']}; border:1px solid {C['line']};
                         border-radius:14px; }}
         #proseUser, #proseBot {{ background:transparent; color:{C['text']};
-                                 font-size:{BODY_PX}px; line-height:158%; }}
+                                 font-size:{BODY_PX}px; line-height:158%;
+                                 font-weight:{600 if UI_BOLD else 400}; }}
         /* reasoning: collapsed to its newest line, expandable to the full trace */
         #reasonPanel {{ background:{C['panel_hi']}; border:1px solid {C['line']};
                         border-left:3px solid {C['faint']}; border-radius:10px; }}
