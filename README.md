@@ -154,9 +154,19 @@ one anyway — those are recognised and turned back into rows and columns, wrapp
 cells and all. **Copy** puts it on the clipboard as markdown, ready to paste
 somewhere else.
 
-A **Tables** skill ships with the app, on the Skills page, covering the part that
-is judgement rather than syntax: when a table earns its place, and how to choose
-the columns. Tick it on when you want it. It is yours to edit or delete.
+The judgement — when a table earns its place, and how to choose the columns — is
+part of the Layout prompt itself, sent with every message, so it needs no skill
+switched on to apply.
+
+**6c · Corrections and emphasis, marked**
+
+Plain markdown works in any reply: `**bold**`, and two more the model is taught
+to reach for on purpose. `~~tildes~~` strike a word through — the natural shape
+for a correction, wrong word left visible next to the right one. `__underscores__`
+underline a word in green, for the one word in a sentence worth the eye landing
+on first.
+
+![Corrections and emphasis](docs/13-markup.png)
 
 **7 · Keep a library of skills**
 
@@ -193,6 +203,14 @@ The About page shows the build number, matching the release tags on GitHub — s
 you never have to guess from a file's date.
 
 ![About](docs/10-about.png)
+
+**10b · Off-white by default, Dark if you'd rather**
+
+CriGent opens in an off-white theme. Switch to the original dark scheme from
+the same About page — it applies straight away, and is remembered next time
+you open the app.
+
+![Theme](docs/14-theme.png)
 
 ---
 
@@ -279,7 +297,7 @@ points CriGent at the existing one.
 | | |
 |---|---|
 | **Chat** | Streamed replies, per-message timing and tokens/sec. Conversations are saved automatically and listed in the sidebar. |
-| **Layout** | Reasoning, instructions, maths, code and tables each get their own container, with a copy button on code. Thinking collapses to its latest line and expands to the full trace. |
+| **Layout** | Reasoning, instructions, maths, code and tables each get their own container, with a copy button on code. Thinking collapses to its latest line and expands to the full trace. `**bold**`, `~~struck out~~` for a correction, `__underlined__` in green for the one word worth landing on. |
 | **Tables** | Real columns, sized to their content, wrapping instead of shearing, and resizing with the window. Asked for with tags; a table the model drew itself in pipes or box-drawing characters is recognised and laid out properly too. Copy takes it as markdown. |
 | **Redo a turn** | Copy any message, regenerate a reply, or edit a prompt — editing rewinds the conversation to that point rather than asking again underneath. |
 | **Models** | See everything installed with size and quantisation, delete with one click, or add any `.gguf` — CriGent writes the Modelfile and imports it for you. Switch models mid-conversation. |
@@ -294,6 +312,7 @@ points CriGent at the existing one.
 | **Context** | How much the model holds in mind at once, from the model's own setting up to 128K. A reply that runs out of room is continued automatically rather than left hanging. |
 | **Compaction** | When the conversation approaches the window, the older part is replaced — for the model — by a verbatim facts ledger plus a summary, and work carries on from that. Automatic, or on demand with **Compact**. The transcript you see and the file on disk are never shortened. |
 | **Recall** | Anything compaction moved out of the prompt can be read back verbatim: the model searches the stored transcript rather than guessing at a detail it no longer has in front of it. |
+| **Theme** | Off-white by default; switch to Dark on the About page. Applies immediately and is remembered. |
 
 ### ⚠️ About Auto-run
 

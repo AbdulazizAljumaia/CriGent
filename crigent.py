@@ -50,7 +50,7 @@ APP_TAGLINE = "A local AI agent — your models, your machine."
 # Shown on the About page and stamped into every logged error, so a report can
 # be tied to a build. Bump this in the same commit as the release tag — a
 # version the app cannot tell you is a version you cannot check.
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 DEV_NAME = "Abdulaziz Al Jumaia"
 DEV_SITE = "https://crimsonlingua.com"
 DEV_LINKEDIN = "https://sa.linkedin.com/in/abdulaziz-al-jumaia"
@@ -283,17 +283,42 @@ FORMAT_SYSTEM_PROMPT = (
     "<text>Ordinary prose. Optional — untagged text is treated as prose.</text>\n"
     "<table>A comparison or a set of records. Each row is a <row>, each cell in "
     "it a <cell>, and the first row is the column headings.</table>\n\n"
-    "A table is the one tag with tags inside it. Write it like this:\n\n"
+    "## Tables\n\n"
+    "A table is the one tag with tags inside it. Write it like this — a real "
+    "example, not a placeholder:\n\n"
     "<table>\n"
     "<caption>Cost per run</caption>\n"
     "<row><cell>Step</cell><cell>Tool</cell><cell>Seconds</cell></row>\n"
     "<row><cell>Fetch</cell><cell>curl</cell><cell>2.4</cell></row>\n"
     "<row><cell>Parse</cell><cell>lxml</cell><cell>0.8</cell></row>\n"
     "</table>\n\n"
-    "Every row has the same number of cells, and <caption> is optional. **Never "
-    "draw a table out of dashes, pipes or box-drawing characters** — they only "
-    "line up in a fixed-width font, and CriGent lays out real columns for you "
-    "from the tags. One cell per <cell>; do not put a whole row in one.\n\n"
+    "Every row has the same number of cells, and <caption> is optional. One "
+    "cell per <cell> — never a whole row crammed into one.\n\n"
+    "Reach for a table when three or more items are compared on two or more "
+    "shared attributes, or the reader will scan down a column rather than "
+    "read across a sentence: options against criteria, before against after, "
+    "a per-file or per-step breakdown, errors against fixes. Two items with "
+    "one attribute each is a sentence, not a table — do not build one just to "
+    "look organised.\n\n"
+    "Choosing columns: the first column names the row (the item, the file, "
+    "the step) and stays short, since it is what the eye comes back to. One "
+    "fact per column — a cell holding \"12 ms, needs a warm index\" is two "
+    "columns pretending to be one. Put the unit in the heading, not in every "
+    "cell. Four to six columns reads well; more than that, split into two "
+    "tables. Keep every row the same length so a missing value shows as a "
+    "blank cell, not a shifted row.\n\n"
+    "**Never draw a table out of dashes, pipes or box-drawing characters** — "
+    "those only line up in a fixed-width font and shear the moment one value "
+    "is longer than the box was drawn for. Use the tags; CriGent lays out "
+    "real columns from them. And do not repeat the table in prose underneath "
+    "— say what it shows (the trend, the outlier, the pick), not what is "
+    "already in it.\n\n"
+    "## Marking up words\n\n"
+    "Plain markdown inside any tag: **bold** for emphasis. Wrap a wrong or "
+    "outdated word in ~~tildes~~ to show it struck through, e.g. when giving "
+    "a correction: \"~~recieve~~ receive\". Wrap a word in __underscores__ to "
+    "underline it in green instead — for the one word you most want the eye "
+    "to land on, not for whole sentences.\n\n"
     "Put your reasoning in <reasoning> and your conclusion outside it, so the "
     "user sees the answer first and can open the thinking if they want it. Do "
     "not nest tags.\n\n"
@@ -363,56 +388,14 @@ SKILL_SYSTEM_PROMPT = (
 )
 
 # Shipped with the app and seeded into the Skills page on first run, then owned
-# by the user: editable, and gone for good if deleted. The layout prompt already
-# teaches the <table> syntax to every reply; this is the judgement that does not
-# belong in a prompt sent on every turn — when a table earns its place, and how
-# to choose the columns.
-BUILTIN_SKILLS = [{
-    "id": "builtin-tables",
-    "name": "Tables",
-    "content": (
-        "Apply this whenever an answer compares things, or lists records that "
-        "share the same fields.\n\n"
-        "## When a table earns its place\n\n"
-        "- Three or more items measured on the same two or more attributes.\n"
-        "- Anything the reader will scan down rather than read across: options "
-        "against criteria, before against after, a per-file or per-step "
-        "breakdown, errors against fixes.\n"
-        "- A single line of prose beats a one-row table. Two items with one "
-        "attribute each is a sentence, not a table.\n"
-        "- Never put prose in a table to make it look organised. If the cells "
-        "hold whole paragraphs, it is a list.\n\n"
-        "## How to write one\n\n"
-        "Use the <table> tag. It is the one tag that has tags inside it: each "
-        "row is a <row>, each cell in it a <cell>, and the first row is the "
-        "column headings.\n\n"
-        "<table>\n"
-        "<caption>Approaches compared</caption>\n"
-        "<row><cell>Approach</cell><cell>Speed</cell><cell>Trade-off</cell></row>\n"
-        "<row><cell>Index scan</cell><cell>12 ms</cell><cell>Needs the index "
-        "kept warm</cell></row>\n"
-        "<row><cell>Full scan</cell><cell>1.9 s</cell><cell>No setup at all"
-        "</cell></row>\n"
-        "</table>\n\n"
-        "## Choosing the columns\n\n"
-        "- First column identifies the row — the name, the file, the step "
-        "number. Keep it short; it is what the eye comes back to.\n"
-        "- One fact per column. A cell holding \"12 ms, needs a warm index\" is "
-        "two columns pretending to be one.\n"
-        "- Same unit down a column, and put the unit in the heading rather than "
-        "repeating it in every cell.\n"
-        "- Four to six columns reads well. More than that and the columns get "
-        "too narrow to scan — split it into two tables.\n"
-        "- Keep every row the same length. A short row is padded, so a missing "
-        "cell shows as a blank rather than shifting the row across.\n\n"
-        "## Avoid\n\n"
-        "- Drawing the table yourself out of `|`, `-`, `+` or box-drawing "
-        "characters. Those only line up in a fixed-width font and shear the "
-        "moment one value is too long; the tags are laid out as real columns.\n"
-        "- Repeating the table in prose underneath. Say what it shows — the "
-        "trend, the outlier, the recommendation — not what is already in it."
-    ),
-}]
+# by the user: editable, and gone for good if deleted.
+BUILTIN_SKILLS = []
+
+# Ids of skills that used to ship here and have since been folded into a prompt
+# sent on every turn — "builtin-tables" moved into FORMAT_SYSTEM_PROMPT in
+# 1.8.0. Kept out of new seeding forever and retired from anyone who still has
+# the unedited copy, so the judgement is not taught twice.
+RETIRED_BUILTIN_SKILLS = {"builtin-tables"}
 
 
 FENCE_RE = re.compile(r"^(`{3,})[ \t]*([A-Za-z0-9_+.#-]*)[ \t]*$")
@@ -885,33 +868,76 @@ GPU_FIELDS = [
 # One cool-neutral hue family for every surface, a single primary accent, and
 # desaturated semantics. Values step evenly so depth reads as elevation, not as
 # five competing colours.
-C = {
-    "bg": "#0e1116",          # window background
-    "panel": "#151922",       # sidebars, header, composer
-    "panel_hi": "#1c212c",    # cards, inputs, raised surfaces
-    "overlay": "#232936",     # hover / pressed states
-    "line": "#232936",        # hairline dividers
-    "line_str": "#333b4b",    # emphasised borders (focus, active)
+# Two full palettes, same keys both sides, so nothing downstream needs to know
+# which one is active — it just reads C. "light" (off-white) is the default;
+# "dark" is the original scheme, kept as the secondary option.
+THEMES = {
+    "light": {
+        "bg": "#faf7f2",          # window background — off-white, not stark white
+        "panel": "#f2ede4",       # sidebars, header, composer
+        "panel_hi": "#ffffff",    # cards, inputs, raised surfaces
+        "overlay": "#e9e2d4",     # hover / pressed states
+        "line": "#e3dbca",        # hairline dividers
+        "line_str": "#cbbfa3",    # emphasised borders (focus, active)
 
-    "text": "#e9edf4",        # primary copy
-    "dim": "#98a3b5",         # secondary copy
-    "faint": "#69748a",       # tertiary, labels, captions
+        "text": "#2b2620",        # primary copy
+        "dim": "#5c5548",         # secondary copy
+        "faint": "#8c8272",       # tertiary, labels, captions
 
-    "accent": "#5b8def",      # primary action
-    "accent_hi": "#7ba6f7",   # hover
-    "accent_soft": "#1e2942", # accent-tinted surface (user bubble)
-    "green": "#4ec9a0",
-    "green_soft": "#16302a",
-    "amber": "#dda657",
-    "amber_soft": "#302819",
-    "red": "#e4646d",
-    "red_soft": "#331b20",
-    "violet": "#9b8cf0",
-    "violet_soft": "#242040",
-    "cyan": "#57bcd9",        # system RAM, so it reads apart from TEMP
+        "accent": "#3763c9",      # primary action
+        "accent_hi": "#2a4fa8",   # hover
+        "accent_soft": "#e3eaf9", # accent-tinted surface (user bubble)
+        "green": "#1f7a5c",
+        "green_soft": "#e0f0e6",
+        "amber": "#96650f",
+        "amber_soft": "#f8ecd6",
+        "red": "#b23a42",
+        "red_soft": "#f7e2e2",
+        "violet": "#6a52c4",
+        "violet_soft": "#eae4f9",
+        "cyan": "#1f7f96",        # system RAM, so it reads apart from TEMP
 
-    "code": "#c6d3e6",        # code foreground
+        "code": "#3a3428",        # code foreground
+    },
+    "dark": {
+        "bg": "#0e1116",          # window background
+        "panel": "#151922",       # sidebars, header, composer
+        "panel_hi": "#1c212c",    # cards, inputs, raised surfaces
+        "overlay": "#232936",     # hover / pressed states
+        "line": "#232936",        # hairline dividers
+        "line_str": "#333b4b",    # emphasised borders (focus, active)
+
+        "text": "#e9edf4",        # primary copy
+        "dim": "#98a3b5",         # secondary copy
+        "faint": "#69748a",       # tertiary, labels, captions
+
+        "accent": "#5b8def",      # primary action
+        "accent_hi": "#7ba6f7",   # hover
+        "accent_soft": "#1e2942", # accent-tinted surface (user bubble)
+        "green": "#4ec9a0",
+        "green_soft": "#16302a",
+        "amber": "#dda657",
+        "amber_soft": "#302819",
+        "red": "#e4646d",
+        "red_soft": "#331b20",
+        "violet": "#9b8cf0",
+        "violet_soft": "#242040",
+        "cyan": "#57bcd9",        # system RAM, so it reads apart from TEMP
+
+        "code": "#c6d3e6",        # code foreground
+    },
 }
+DEFAULT_THEME = "light"
+
+C = dict(THEMES[DEFAULT_THEME])
+
+
+def apply_theme(name: str):
+    """Swap the active palette in place — every reader holds C itself, not a
+    copy of a value out of it, so a repaint or a stylesheet rebuild after this
+    picks the new colours up without anything needing to be told to."""
+    C.clear()
+    C.update(THEMES.get(name, THEMES[DEFAULT_THEME]))
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -1487,6 +1513,10 @@ def _inline(text: str) -> str:
                f'<code style="background:{C["overlay"]};color:{C["code"]};'
                r'border-radius:4px;padding:1px 5px;">\1</code>', s)
     s = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"~~([^~]+)~~", r"<s>\1</s>", s)
+    s = re.sub(r"__([^_]+)__",
+               f'<span style="color:{C["green"]};text-decoration:underline;">'
+               r"\1</span>", s)
     s = re.sub(r"(?m)^\s*[-*]\s+", "&nbsp;&nbsp;• ", s)
     s = re.sub(r"(?m)^(#{1,4})\s*(.+)$", r"<b>\2</b>", s)
     return s.replace("\n", "<br>")
@@ -1558,6 +1588,10 @@ class RingGauge(QWidget):
 
     shown = pyqtProperty(float, fget=get_shown, fset=set_shown)
 
+    def set_color(self, color: str):
+        self.color = QColor(color)
+        self.update()
+
     def set_value(self, pct: float, caption: str = ""):
         self.caption = caption
         self._value = max(0.0, min(100.0, pct))
@@ -1620,6 +1654,10 @@ class Sparkline(QWidget):
 
     def push(self, v: float):
         self.data.append(max(0.0, min(100.0, v)))
+        self.update()
+
+    def set_color(self, color: str):
+        self.color = QColor(color)
         self.update()
 
     def paintEvent(self, _):
@@ -4036,6 +4074,7 @@ class CriGent(QMainWindow):
         self.skills = self._read_skills_file()
         self.prompts = self._read_prompts_file()
         self.settings = self._read_settings()
+        apply_theme(self.settings.get("theme", DEFAULT_THEME))
         self._seed_builtin_skills()
         self.usage = load_usage()
         self._import_worker = None
@@ -5200,6 +5239,28 @@ class CriGent(QMainWindow):
         hero.box.addLayout(top)
         body.addWidget(hero)
 
+        theme_card = Card("Theme")
+        theme_row = QHBoxLayout()
+        theme_row.setSpacing(8)
+        self.theme_group = QButtonGroup(self)
+        self.theme_group.setExclusive(True)
+        current_theme = self.settings.get("theme", DEFAULT_THEME)
+        for key, label in (("light", "Off-white"), ("dark", "Dark")):
+            btn = QPushButton(label)
+            btn.setObjectName("pillTheme")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setChecked(key == current_theme)
+            self.theme_group.addButton(btn)
+            btn.clicked.connect(lambda _checked, k=key: self._on_theme_changed(k))
+            theme_row.addWidget(btn)
+        theme_row.addStretch()
+        theme_card.box.addLayout(theme_row)
+        note = QLabel("Off-white is the default; Dark is there if you prefer it.")
+        note.setObjectName("pageSub")
+        theme_card.box.addWidget(note)
+        body.addWidget(theme_card)
+
         dev = Card("Developer")
         who = QLabel(DEV_NAME)
         who.setObjectName("skillName")
@@ -5229,6 +5290,32 @@ class CriGent(QMainWindow):
         body.addWidget(dev)
         body.addStretch()
         return page
+
+    def _on_theme_changed(self, key: str):
+        if self.settings.get("theme", DEFAULT_THEME) == key:
+            return
+        apply_theme(key)
+        self.settings["theme"] = key
+        self._save_settings()
+        # Every colour below comes from C, read fresh at paint/polish time —
+        # reapplying the stylesheet repolishes every QSS-styled widget, and
+        # custom paintEvent()s (the Track graphs, table cells) pick the new
+        # values up on their next repaint, which this also triggers.
+        self.setStyleSheet(self._qss())
+        # The Track page's gauges paint a QColor captured at construction, not
+        # read from C each frame like everything else here — nudge the five
+        # rings and three sparklines back onto the new palette explicitly.
+        for gauge, key in ((getattr(self, "g_util", None), "accent"),
+                           (getattr(self, "g_mem", None), "violet"),
+                           (getattr(self, "g_ram", None), "cyan"),
+                           (getattr(self, "g_temp", None), "green"),
+                           (getattr(self, "g_pow", None), "amber"),
+                           (getattr(self, "spark_util", None), "accent"),
+                           (getattr(self, "spark_mem", None), "violet"),
+                           (getattr(self, "spark_ram", None), "cyan")):
+            if gauge is not None:
+                gauge.set_color(C[key])
+        self.update()
 
     def _open_url(self, url: str):
         """Hand the link to the user's default browser."""
@@ -6628,6 +6715,12 @@ class CriGent(QMainWindow):
         does not get the original handed back on the next launch. Upgrading is
         then also how a genuinely new built-in skill arrives.
         """
+        before = len(self.skills)
+        self.skills = [sk for sk in self.skills
+                       if sk.get("id") not in RETIRED_BUILTIN_SKILLS]
+        if len(self.skills) != before:
+            self._save_skills()
+
         seeded = set(self.settings.get("seeded_skills") or [])
         have = {sk.get("id") for sk in self.skills}
         added = False
@@ -7191,17 +7284,19 @@ class CriGent(QMainWindow):
         /* toggle pills — off reads as quiet chrome, on reads as clearly armed */
         #pillSkills:checked {{ background:{C['green_soft']}; color:{C['green']};
                                border-color:{C['green']}; }}
-        #pillTools, #pillAutorun, #pillWeb, #pillSkills {{
+        #pillTools, #pillAutorun, #pillWeb, #pillSkills, #pillTheme {{
             background:transparent; color:{C['faint']}; border:1px solid {C['line_str']};
             border-radius:14px; padding:5px 14px; font-size:12px; font-weight:500; }}
-        #pillTools:hover, #pillAutorun:hover, #pillWeb:hover, #pillSkills:hover {{
-            color:{C['text']}; background:{C['overlay']}; }}
+        #pillTools:hover, #pillAutorun:hover, #pillWeb:hover, #pillSkills:hover,
+        #pillTheme:hover {{ color:{C['text']}; background:{C['overlay']}; }}
         #pillTools:checked {{ background:{C['amber_soft']}; color:{C['amber']};
                               border-color:{C['amber']}; }}
         #pillAutorun:checked {{ background:{C['red_soft']}; color:{C['red']};
                                 border-color:{C['red']}; }}
         #pillWeb:checked {{ background:{C['violet_soft']}; color:{C['violet']};
                             border-color:{C['violet']}; }}
+        #pillTheme:checked {{ background:{C['accent_soft']}; color:{C['accent']};
+                              border-color:{C['accent']}; }}
         #pillAutorun:disabled {{ color:#4a5464; border-color:{C['line']}; }}
         #autorunWarn {{ color:{C['red']}; font-size:12px; font-weight:500;
                         background:{C['red_soft']}; border:1px solid {C['red']};
